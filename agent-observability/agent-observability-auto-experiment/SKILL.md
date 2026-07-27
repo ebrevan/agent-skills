@@ -285,32 +285,27 @@ backends are not strictly comparable.
 | dataset records (previews + schema) | `get_llmobs_dataset_records` | `pup llm-obs datasets records --project-id P --dataset-id D` ✅ |
 | dataset records (untrimmed) | `get_llmobs_full_dataset_records` | `pup llm-obs datasets records-full --project-id P --dataset-id D` ✅ |
 | find traces for an `ml_app` | `search_llmobs_spans` | `pup llm-obs spans search --ml-app A --from 7d` ✅ (note: `--from` takes `7d`, **not** `now-7d`) |
-| full trace tree | `get_llmobs_trace` | `pup llm-obs spans get-trace --trace-id T` ❌ **HTTP 404** |
-| span field inventory | `get_llmobs_span_details` | `pup llm-obs spans get-details --trace-id T` ❌ **HTTP 404** |
-| span content (`messages`) | `get_llmobs_span_content` | `pup llm-obs spans get-content --trace-id T --span-id S --field messages` ❌ **HTTP 404** |
-| expand a trace's spans | `expand_llmobs_spans` | `pup llm-obs spans expand --trace-id T` ❌ **HTTP 404** |
+| full trace tree | `get_llmobs_trace` | `pup llm-obs spans get-trace --trace-id T --from 7d --to now` ✅ |
+| span field inventory | `get_llmobs_span_details` | `pup llm-obs spans get-details --trace-id T --span-ids S --from 7d --to now` ✅ |
+| span content (`messages`) | `get_llmobs_span_content` | `pup llm-obs spans get-content --trace-id T --span-id S --field messages --from 7d --to now` ✅ |
+| expand a trace's spans | `expand_llmobs_spans` | `pup llm-obs spans expand --trace-id T --span-ids S --from 7d --to now` ✅ |
 | record run context / status | `update_llmobs_experiment` | `pup llm-obs experiments update --file payload.json <EXPERIMENT_ID>` ⚠️ exits 1, write lands |
 | submit an iteration's score | `submit_llmobs_experiment_events` | `pup llm-obs experiments events submit --metrics '<json array>' <EXPERIMENT_ID>` ✅ |
 
-### 🚫 pup cannot serve a trace-derived data source
+### ⏱ pup's span commands default to a 1-hour window — always pass `--from`/`--to`
 
-The four `spans get-*` commands return **HTTP 404** from
-`/api/unstable/llm-obs-mcp/v1/trace/*` under API-key auth, while the MCP tools read the very same
-trace successfully (verified side by side on one trace id: MCP returned 36 spans, pup 404'd). This is
-a **pup gap, not a platform gap**. `spans search` works; only the per-trace drill-downs fail.
-(Untested hypothesis for why: those routes may require the OAuth session from `pup auth login`
-rather than `DD_API_KEY`/`DD_APP_KEY`. Do not state that as fact without checking.)
+Every `pup llm-obs spans *` command defaults to `--from 1h`. A trace older than that returns
+**HTTP 404 with `{"detail": "no spans found for trace <id>"}"`** — which reads exactly like a missing
+route and is easy to misdiagnose as one. It is not: the routes serve fine, the window just excluded
+the trace. Pass an explicit window (`--from 7d --to now`) whenever you address a trace by id, and
+**read the whole error body** before concluding a command is unsupported; the 404's `detail` says
+precisely what happened.
 
-Consequence — treat it as an intake constraint, not a mid-run surprise:
-
-- `datadog_backend: pup` supports **`local_dataset_path`** (no backend at all) and **`dataset_id`**.
-- `datadog_backend: pup` **cannot** serve **`trace_ids`** or **`ml_app`**, because Step 1 needs
-  `get-trace` / `get-details` / `get-content` to extract the `messages` field per the
-  messages-source guidance, and all three 404.
-- If the resolved config pairs `pup` with a trace-derived source, **STOP at the intake gate** and say
-  so plainly: the user picks `mcp`, or supplies a `dataset_id`/`local_dataset_path`. Do not silently
-  fall back to MCP (that would falsify the recorded provenance) and do not start a run that will die
-  in Step 1.
+The MCP tools default to a wider window (`now-1d` for `get_llmobs_trace`), so the same trace id can
+succeed on MCP and 404 on pup purely from the default. That difference is a window, not a capability:
+all four per-trace commands were verified working under pup 1.8.0 with an explicit window, returning
+the same trace structure as MCP (36 spans on the same id). **pup can serve every data source the
+skill supports**, `trace_ids` and `ml_app` included.
 
 **Version sensitivity — pin what you test against.** pup's CLI is not yet stable across minor
 versions: `experiments events submit` took `--file <path>` in 1.7.0 and takes `--metrics '<json
