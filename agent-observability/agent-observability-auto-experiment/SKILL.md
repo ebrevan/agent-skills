@@ -66,6 +66,7 @@ run starts** (see the Mandatory intake gate below).
 | `model` | judge model id | _default_: the Claude model selected in this session (see rubric) |
 | `base_branch` | branch the baseline is measured on | _default_: current branch / `main` |
 | `domain_notes` | **a list of strings** — product/domain facts the agents cannot infer from the code (what a term of art means, which behaviours are intended, what a reference row represents), one note per entry. Carried verbatim into every sub-agent briefing, every census describer, and the judge prompt. | _default_ **`[]`** |
+| `datadog_backend` | `mcp` or `pup` — which client reaches Datadog for **every** call the run makes (dataset reads, span/trace reads, and the experiment create/update/event-submit writes). See **Datadog backend** below. | _default_ **`mcp`** |
 
 `runs` and `min_delta` are **not inputs** — they are **derived** from the measured baseline noise in
 Step 2.4, not chosen by anyone. Do **not** ask for them and do **not** show them in the all-params
@@ -119,8 +120,9 @@ Before writing any config or touching git:
    `config.json`, do not create the scratch branch, do not run the harness — ask (use
    `AskUserQuestion`) and wait.
 2. Fill the **default** fields (`max_iterations`, `max_runs`, `model`, `base_branch`,
-   `domain_notes`) with their defaults above. Do **not** touch `runs`/`min_delta` here — they are
-   derived in Step 2.4, not intake params (`max_runs` only caps that derivation).
+   `domain_notes`, `datadog_backend`) with their defaults above. Do **not** touch
+   `runs`/`min_delta` here — they are derived in Step 2.4, not intake params (`max_runs` only caps
+   that derivation).
 
    `domain_notes` defaults to empty and an empty value is fine — but **offer it**: when you show the
    resolved config, invite the user to add any product context the code does not carry (what a term
@@ -152,6 +154,9 @@ the run's state + audit trail):
   "local_dataset_path": "...", "dataset_id": "...", "trace_ids": [...],
   "dd_auto_experiment_id": null,
   "domain_notes": [],
+  "datadog_backend": "mcp",
+  "backend_used": null,
+  "backend_fallback": false,
   "max_iterations": 2,
   "max_runs": 3,
   "runs": null,
@@ -267,6 +272,80 @@ are not re-learned from scratch every iteration and every run.
   the notes' trust level. Seal the notes' block too: not because notes are suspect, but because a
   note quoting markup would otherwise close its own block by accident.
 
+## Datadog backend — MCP or pup
+
+`datadog_backend` selects the client for **every** Datadog call this run makes. It is one switch, not
+per-call: a run is unambiguously "via MCP" or "via pup", so its provenance is never mixed. Record the
+backend actually used in `config.json` as `backend_used`, because two runs that reached different
+backends are not strictly comparable.
+
+| purpose | `mcp` | `pup` |
+|---|---|---|
+| dataset records (previews + schema) | `get_llmobs_dataset_records` | `pup llm-obs datasets records --project-id P --dataset-id D` |
+| dataset records (untrimmed) | `get_llmobs_full_dataset_records` | `pup llm-obs datasets records-full --project-id P --dataset-id D` |
+| find traces for an `ml_app` | `search_llmobs_spans` | `pup llm-obs spans search` |
+| full trace tree | `get_llmobs_trace` | `pup llm-obs spans get-trace --trace-id T` |
+| span field inventory | `get_llmobs_span_details` | `pup llm-obs spans get-details --trace-id T` |
+| span content (`messages`) | `get_llmobs_span_content` | `pup llm-obs spans get-content --trace-id T --span-id S --field messages` |
+| expand a trace's spans | `expand_llmobs_spans` | `pup llm-obs spans expand --trace-id T` |
+| record run context / status | `update_llmobs_experiment` | `pup llm-obs experiments update --file payload.json` |
+| submit an iteration's score | `submit_llmobs_experiment_events` | `pup llm-obs experiments events submit --file payload.json` |
+
+**Read this table as a substitution rule for the whole file.** The steps below name MCP tools
+because that is the default backend; wherever one appears, it means *"this purpose, via the selected
+backend"*. Under `datadog_backend: pup`, `submit_llmobs_experiment_events` means
+`pup llm-obs experiments events submit --file …`, and so on down the table. Nothing else about a step
+changes — same order, same gates, same payloads.
+
+**The payload contents, tag encoding and `reasoning` text are identical in both backends** — the
+backend changes the transport, never what is reported. The tag-normalization rules still apply (see
+the warning in the reporting section); do not assume a different client escapes differently until you
+have inspected an ingested event.
+
+**pup call mechanics, verified against pup 1.7.0** — get these wrong and the command fails or, worse,
+appears to fail while succeeding:
+
+- **Reads are wrapped.** In agent mode pup emits `{"status": ..., "data": ..., "metadata": ...}` and
+  `data` is exactly the body the MCP tool returns. **Unwrap `.data`** before parsing; the record
+  contents, order and field names are otherwise identical (verified side by side).
+- **`experiments update` and `experiments events submit` take the experiment id as a POSITIONAL
+  argument**, not a flag, and it does **not** belong in the payload:
+  `pup llm-obs experiments events submit --file payload.json <EXPERIMENT_ID>`, where `payload.json`
+  is `{"metrics": [ … ]}` — the `experiment_id` key the MCP tool wants is omitted.
+- ⚠️ **A non-zero pup exit does NOT mean the write failed.** `experiments create` and
+  `experiments update` currently fail while *deserializing the API's response* (`missing field
+  config`, and `EOF while parsing a value` for update's empty body) and exit non-zero **after the
+  write has already landed** — both were confirmed applied by reading the experiment back. So for
+  pup writes, **verify by reading state back, never by exit code**; treating exit 1 as failure will
+  send you into a spurious retry loop that double-writes. `experiments events submit` is well behaved
+  (exit 0, and it returns the same `{experiment_id, metrics_ingested, status}` shape as MCP), so the
+  per-iteration score submission can still be confirmed the normal way.
+- `experiments create` additionally requires `data.attributes.project_id` (it uses the typed v2 route),
+  which the `unstable` REST route does not. The skill never creates an experiment — the id is an
+  input — so this only matters if you are provisioning one by hand.
+
+**Auth.** pup reads whatever credential it is already configured with — an OAuth session from
+`pup auth login`, or `DD_API_KEY`/`DD_APP_KEY`/`DD_SITE` from the environment. Confirm it with
+`pup auth status`. Same rule as the LLM client: **do not enumerate, print, log or commit any
+credential value**; you are checking that auth works, not reading what it is.
+
+### Failure policy — deliberately asymmetric
+
+- **`datadog_backend: pup` and pup is missing from `PATH` or unauthenticated → STOP and report.**
+  Do **not** fall back to MCP. The user asked for pup explicitly, so quietly using a different client
+  would make the run's recorded provenance false. Abort before any git work or measurement, the same
+  way the intake gate aborts on a missing must-ask field. Accept a `PUP_BIN` env override for a
+  non-`PATH` binary (e.g. a dev checkout's `target/debug/pup`) before declaring it missing.
+- **`datadog_backend: mcp` and an MCP call fails → fall back to pup, loudly.** Say so in the run
+  output, set `backend_used: "pup"` and `backend_fallback: true` in `config.json`, and note which MCP
+  call failed. A run that would otherwise die is worth rescuing on the other transport.
+  **Do not expect the fallback to fix a read-back gap, though**: submitted summary-level experiment
+  metrics are not retrievable through *either* client (verified — pup's `experiments events list` and
+  `experiments summary` both report zero events for an experiment whose submission was accepted), so
+  that limitation is in the platform, not in MCP. Fall back for *failed calls*, not for missing reads.
+- The asymmetry is the point: falling back **to** pup rescues a run, falling back **from** pup
+  fabricates provenance. Never do the second.
+
 ## Setup
 
 1. Confirm a clean-ish working tree (stash or warn on unrelated changes). Note the starting SHA.
@@ -326,7 +405,8 @@ ran because you intended it to.
 | 2 | scratch branch | `git branch --show-current` equals the scratch branch off `base_branch` |
 | 3 | `config.json` written | file exists with every required field populated (incl. the resolved `files_to_optimize` list, `evaluators` verbatim, data source) |
 | 4 | experiment id | `$experiment-id` validated as a UUID at the intake gate and persisted to `config.json` as `dd_auto_experiment_id` |
-| 5 | run context on experiment | confirm the `update_llmobs_experiment` call **actually returned a success response in hand** (not merely that you intended to call it). For the us5 MCP that response is `updated_fields` containing `"metadata"` — accept that, or any non-error response acknowledging the metadata write if the tool's shape differs. The check is "the call was made and acknowledged", so do not hard-block on one exact field name; if the tool errored or was never called, re-run it. |
+| 5 | run context on experiment | confirm the `update_llmobs_experiment` call (or `pup llm-obs experiments update`) **actually returned a success response in hand** (not merely that you intended to call it). For the us5 MCP that response is `updated_fields` containing `"metadata"` — accept that, or any non-error response acknowledging the metadata write if the tool's shape differs. The check is "the call was made and acknowledged", so do not hard-block on one exact field name; if it errored or was never called, re-run it. |
+| 6 | backend reachable | with `datadog_backend: pup`, `pup auth status` (or `$PUP_BIN auth status`) returned `authenticated: true` for the expected site — run the check, don't assume the binary works. A missing or unauthenticated pup is a **STOP**, not a fallback (see **Datadog backend**). With `datadog_backend: mcp`, step 5's acknowledged response is itself the proof the backend is reachable. Record `backend_used` in `config.json` either way. **Under pup, satisfy step 5 by reading the experiment back** (`pup llm-obs experiments list --filter-project-id …` and confirm the metadata/status you just wrote), because `experiments update` exits non-zero on a response-parsing bug even when the write landed — an exit-code check would fail a step that actually succeeded. |
 
 State the gate result briefly (each step ✓ with its evidence) before Step 1. This same
 "external-effect step → verify against an artifact" discipline is why per-iteration score
@@ -375,6 +455,9 @@ Pick the data source in this priority order and materialize it to `.auto_experim
 4. **else** → fetch the last ~30 LLM traces for `ml_app` (search LLM-Obs spans), and record the
    trace IDs you used back into `config.json` `trace_ids` so later iterations reuse the SAME
    corpus.
+
+Sources 2–4 go through the selected `datadog_backend` (see the substitution table there); source 1,
+a `local_dataset_path`, touches no backend at all and is unaffected by the flag.
 
 For the **trace-derived sources** (`trace_ids` / `ml_app`), extract input/output per the
 **messages-source guidance** in `references/rubrics.md` (score the `messages` field on the child LLM
@@ -574,7 +657,9 @@ the end of the whole run — `avg_iteration_elapsed × iterations_left`, → `0`
 iteration; see **Setup** step 5) and `update_llmobs_experiment` — one call, re-sending
 `repo`/`branch`/`model` unchanged.
 
-Call `submit_llmobs_experiment_events` with a single metric shaped exactly like this:
+Call `submit_llmobs_experiment_events` — or, under `datadog_backend: pup`,
+`pup llm-obs experiments events submit --file payload.json` with the same object written to
+`payload.json` — with a single metric shaped exactly like this:
 
 - `experiment_id`: `$experiment-id` (the validated skill argument, also persisted to `config.json`
   as `dd_auto_experiment_id`). Do not ask the user and do not invent one.
