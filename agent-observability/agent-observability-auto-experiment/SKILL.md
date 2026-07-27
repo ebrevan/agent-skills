@@ -180,6 +180,11 @@ so a client can render the spread (boxplot/violin/etc.):
 last run's scored datapoints); `min`/`q1`/`median`/`q3`/`max` are computed from it. No new eval
 work — the scores already exist; just collect them and compute the quartiles when you append the row.
 
+The **five-number summary is also published to LLM-Obs** on that iteration's metric as `dist_*` tags
+(see the distribution tags under **Report each iteration's score to LLM-Obs**), so the spread travels
+with the score instead of living only on disk. `values` stays local — the per-datapoint array is too
+large for a tag list; the experiment event carries the summary, `config.json` carries the raw scores.
+
 ## Scope — optimize the whole selected surface, not just the prompt
 
 `files_to_optimize` is a **scope**, not a prompt pointer. It may be a set of files, a directory, or
@@ -370,7 +375,9 @@ now** (amend the Step 2 commit or add a new one) so a single commit contains the
 `eval_results.jsonl`, derived `runs`/`min_delta`, and `run_means`. Only then submit exactly one
 eval-metric datapoint with `score_value` = the **final** `before_score` (the re-run mean if `runs`
 was raised, else the pilot mean) and tags `["iteration:0",
-"git.commit.sha:<baseline_commit_sha>", "decision:baseline"]` — the sha is the **full 40-character**
+"git.commit.sha:<baseline_commit_sha>", "decision:baseline"]` plus the decision-legibility and
+`dist_*` distribution tags that section requires (the baseline has a computed score, so it carries
+its five-number summary too) — the sha is the **full 40-character**
 hash of that just-committed final-baseline commit (`git rev-parse HEAD`), and the score must match
 the `before_score` every downstream iteration gates against. Same call shape and rules as **Report
 each iteration's score to LLM-Obs**; this is the only submission with `iteration:0` and
@@ -522,6 +529,18 @@ Call `submit_llmobs_experiment_events` with a single metric shaped exactly like 
     - `time_start:<iso>` and `time_end:<iso>` — this iteration's ISO-8601 UTC wall-clock start/end,
       copied verbatim from the `iteration_results` row (see **Per-iteration timing** above) so the
       experiment view can show per-iteration duration. Must match the row exactly; never fabricate.
+  - **Distribution tags (required on every iteration that has a computed score).** `score_value` is
+    a single mean — it hides whether the iteration scored uniformly well or split into perfect and
+    zero datapoints, which is the difference between "broadly better" and "traded one bucket for
+    another". Publish the five-number summary from the row's `score_distribution` (see
+    **Per-iteration score distribution**) as five tags, each rounded to **4 decimal places**:
+    `dist_min:<X.XXXX>`, `dist_q1:<X.XXXX>`, `dist_median:<X.XXXX>`, `dist_q3:<X.XXXX>`,
+    `dist_max:<X.XXXX>` (e.g. `dist_q1:0.6667`). Copy them from the `iteration_results` row —
+    the same numbers, computed from that iteration's `eval_results.jsonl`, never re-derived by hand
+    and never estimated. The `dist_*` prefix keeps them distinct from `min_delta`, which is the
+    keep/discard floor and unrelated to the score spread. The raw `values` array is **not** tagged
+    (35+ tags per event); it stays in `config.json`. **Omit all five on a `no_change` iteration** —
+    it has no computed distribution (see **No-change iterations**).
   - `reasoning`: this iteration's `reasoning` string from `iteration_results`. **Lead with a
     one-line verdict** that states the decision and its basis in plain terms before the details,
     e.g. `"KEPT (tentative) — higher point estimate in the goal's direction (Δvs_best +0.016) but
@@ -543,7 +562,7 @@ Example arguments for iteration 5 whose harness computed a score of `0.72`:
       "score_value": 0.72,
       "reasoning": "KEPT — significant (Δvs_best +0.048, t=3.1). Rewrote the retrieval query builder to include entity synonyms (targeting the 'missed-retrieval' census bucket); cleared the t-test (|t|≥2) and passed the mechanism audit.",
       "timestamp_ms": 1752430000000,
-      "tags": ["iteration:5", "git.commit.sha:33ec6e0959bd46b0ea9c337cf6a28a763d3eeb0a", "decision:kept", "basis:significant", "delta_vs_best:+0.0480", "t_stat:3.1", "significant:true", "time_start:2026-07-22T14:31:07Z", "time_end:2026-07-22T14:38:52Z"]
+      "tags": ["iteration:5", "git.commit.sha:33ec6e0959bd46b0ea9c337cf6a28a763d3eeb0a", "decision:kept", "basis:significant", "delta_vs_best:+0.0480", "t_stat:3.1", "significant:true", "time_start:2026-07-22T14:31:07Z", "time_end:2026-07-22T14:38:52Z", "dist_min:0.0000", "dist_q1:0.6667", "dist_median:1.0000", "dist_q3:1.0000", "dist_max:1.0000"]
     }
   ]
 }
@@ -583,7 +602,9 @@ carry-forward instead:
   alone can never distinguish a no-eval carry-forward from a genuinely-measured `0`; only the
   `decision` tag can. Consumers of `auto_experiment_score` **must** branch on `decision` — exclude
   `decision:no_change` from any score aggregate (mean/best-pick), since its value is a marker, not a
-  measurement.
+  measurement. **Send no `dist_*` tags** on a `no_change` event: no eval ran, so there is no
+  distribution — carrying the previous best's spread forward would dress a non-measurement up as a
+  measured one. Absent `dist_*` is the honest signal.
 - `reasoning`: state plainly that no full eval ran, why (e.g. the probe result), and that the value
   is the carried-forward best — not a measured score.
 
@@ -640,7 +661,8 @@ non-measurement: carried-forward value + `decision:no_change`. Do **not** tag it
    - **Propagate a promotion to LLM-Obs.** The best's metric was already submitted with its
      iteration-level `basis:within_noise`. If confirmation upgrades it to `significant`, that tag is
      now stale. Re-submit that iteration's metric (same `iteration:<n>`, same sha, same
-     `score_value`) with `decision:kept` + `basis:promoted` + a `promoted:higher_power_confirmation`
+     `score_value`, same `dist_*` tags — the confirmation re-labels confidence, it does not restate
+     the distribution) with `decision:kept` + `basis:promoted` + a `promoted:higher_power_confirmation`
      tag and a `reasoning` stating it supersedes the earlier `within_noise` label (cite the t-test).
      This is the one sanctioned exception to "exactly one metric per iteration" — the later event is
      a correction, not a second measurement. Leave a best that stays `within_noise` as-is.
