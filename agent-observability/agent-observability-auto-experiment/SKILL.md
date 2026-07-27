@@ -299,10 +299,32 @@ there are no unsupported purposes. Two markers:
 - ⚠️ **exits non-zero even when the write succeeds.** Verify by reading state back, not by exit
   code; see the call mechanics below.
 
+### ⏱ pup's span commands default to a 1-hour window — always pass `--from`/`--to`
+
+Every `pup llm-obs spans *` command defaults to `--from 1h`. A trace older than that returns
+**HTTP 404 with `{"detail": "no spans found for trace <id>"}"`** — which reads exactly like a missing
+route and is easy to misdiagnose as one. It is not: the routes serve fine, the window just excluded
+the trace. Pass an explicit window (`--from 7d --to now`) whenever you address a trace by id — pup's own
+format (`7d`) is required, the MCP-style `now-7d` is **rejected** as unparseable — and
+**read the whole error body** before concluding a command is unsupported; the 404's `detail` says
+precisely what happened.
+
+The MCP tools default to a wider window (`now-1d` for `get_llmobs_trace`), so the same trace id can
+succeed on MCP and 404 on pup purely from the default. That difference is a window, not a capability:
+all four per-trace commands were verified working under pup 1.8.0 with an explicit window, returning
+the same trace structure as MCP (36 spans on the same id). **pup can serve every data source the
+skill supports**, `trace_ids` and `ml_app` included.
+
+**Version sensitivity — pin what you test against.** pup's CLI is not yet stable across minor
+versions: `experiments events submit` took `--file <path>` in 1.7.0 and takes `--metrics '<json
+array>'` in 1.8.0. Check `pup --version` and `pup agent schema` for the installed build rather than
+trusting this table's flags verbatim, and record the version in `config.json` alongside
+`backend_used`.
+
 **Read this table as a substitution rule for the whole file.** The steps below name MCP tools
 because that is the default backend; wherever one appears, it means *"this purpose, via the selected
 backend"*. Under `datadog_backend: pup`, `submit_llmobs_experiment_events` means
-`pup llm-obs experiments events submit --file …`, and so on down the table. Nothing else about a step
+`pup llm-obs experiments events submit --metrics '[{…}]' <EXPERIMENT_ID>`, and so on down the table. Nothing else about a step
 changes — same order, same gates, same payloads.
 
 **The payload contents, tag encoding and `reasoning` text are identical in both backends** — the
@@ -667,8 +689,7 @@ iteration; see **Setup** step 5) and `update_llmobs_experiment` — one call, re
 `repo`/`branch`/`model` unchanged.
 
 Call `submit_llmobs_experiment_events` — or, under `datadog_backend: pup`,
-`pup llm-obs experiments events submit --file payload.json` with the same object written to
-`payload.json` — with a single metric shaped exactly like this:
+`pup llm-obs experiments events submit --metrics '[{…}]' <EXPERIMENT_ID>` with the same metric objects passed inline — with a single metric shaped exactly like this:
 
 - `experiment_id`: `$experiment-id` (the validated skill argument, also persisted to `config.json`
   as `dd_auto_experiment_id`). Do not ask the user and do not invent one.
