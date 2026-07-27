@@ -282,8 +282,9 @@ backends are not strictly comparable.
 
 | purpose | `mcp` tool | `pup llm-obs …` subcommand | |
 |---|---|---|---|
-| dataset records (previews + schema) | `get_llmobs_dataset_records` | `datasets records --project-id P --dataset-id D` | |
-| dataset records (untrimmed) | `get_llmobs_full_dataset_records` | `datasets records-full --project-id P --dataset-id D` | |
+| **read the whole dataset** | `get_llmobs_dataset_records` (paged) | `datasets records-all --dataset-id D` | ★ |
+| browse a few records + schema | `get_llmobs_dataset_records --limit N` | `datasets records --project-id P --dataset-id D --limit N` | ⚠️ caps at ~19 |
+| untrimmed specific records | `get_llmobs_full_dataset_records` | `datasets records-full --record-ids "a,b,c"` | max 3 ids |
 | find traces for an `ml_app` | `search_llmobs_spans` | `spans search --ml-app A` | ⏱ |
 | full trace tree | `get_llmobs_trace` | `spans get-trace --trace-id T` | ⏱ |
 | span field inventory | `get_llmobs_span_details` | `spans get-details --trace-id T --span-ids S` | ⏱ |
@@ -295,9 +296,39 @@ backends are not strictly comparable.
 Every pup row is prefixed `pup llm-obs` and every one was **run successfully against pup 1.8.0** —
 there are no unsupported purposes. Two markers:
 
+- ★ **use this to load the eval corpus.** Both backends must read the SAME records or the run's
+  scores are not comparable to a run on the other backend; see **Loading the whole dataset** below.
 - ⏱ **pass an explicit `--from`/`--to`.** These default to a 1-hour window; see below.
 - ⚠️ **exits non-zero even when the write succeeds.** Verify by reading state back, not by exit
   code; see the call mechanics below.
+
+### ★ Loading the whole dataset — same records on both backends
+
+Step 1 must materialize **every** scoreable record, and the two backends reach that differently:
+
+- **mcp** — `get_llmobs_dataset_records` returns `next_cursor`; page until it is empty.
+- **pup** — `pup llm-obs datasets records-all --dataset-id D [--limit N]`, which pages the REST
+  route internally and returns the aggregate in one call. Needs no `--project-id`.
+
+**Do NOT use `pup llm-obs datasets records` to load the corpus.** It posts to an MCP-token-budget
+endpoint that trims to a response-size budget — about **19 records** on a dataset with sizeable
+inputs — reports `truncated: true`, and returns **no cursor**, so the remainder is unreachable and
+`--cursor` has nothing to consume. A run built on that subset silently measures a different corpus
+than an mcp run of the same `dataset_id`: different split, different class balance, no comparability.
+`records-full` is not a workaround either — it caps at 3 ids per call and needs the id list you
+cannot obtain.
+
+`records-all` requires **pup with DataDog/pup#678** (merged 2026-07-27; released after 1.8.0). On an
+older pup the subcommand does not exist — `unrecognized subcommand 'records-all'`, exit 2. Detect it
+before Step 1 and treat its absence as a **STOP** under `datadog_backend: pup`, exactly like a
+missing binary: continuing on the capped `records` path would produce a run whose corpus is a
+truncation artifact. Check with `pup llm-obs datasets records-all --dataset-id X` and inspect the
+exit code — **not** `--help`, which exits 0 for unknown subcommands on some builds and will tell you
+the feature is present when it is not.
+
+**Verify the count after loading, on either backend:** assert the materialized record count equals
+the dataset's true size before splitting. This is the cheap check that catches a silent truncation,
+and it is the one that was missing when a pup run was built on 19 of 50 records.
 
 ### ⏱ pup's span commands default to a 1-hour window — always pass `--from`/`--to`
 
@@ -480,7 +511,7 @@ Pick the data source in this priority order and materialize it to `.auto_experim
    it does not — never fabricate data), normalize each row to the same `{input, expected_output?,
    id?}` shape as the other sources, and copy it to `.auto_experiment/data.jsonl`. Assign a
    deterministic `id` to any row lacking one. This source is fully offline.
-2. **else `dataset_id` present** → `get_llmobs_dataset_records` + `get_llmobs_full_dataset_records`.
+2. **else `dataset_id` present** → load **every** record: on `mcp` page `get_llmobs_dataset_records` until `next_cursor` is empty; on `pup` call `datasets records-all --dataset-id D` (see **Loading the whole dataset** — the plain `records` subcommand caps at ~19 and must not be used for the corpus). Assert the loaded count equals the dataset's size before splitting.
 3. **else non-empty `trace_ids`** → `get_llmobs_trace` (full tree), `get_llmobs_span_details`,
    `get_llmobs_span_content`.
 4. **else** → fetch the last ~30 LLM traces for `ml_app` (search LLM-Obs spans), and record the
