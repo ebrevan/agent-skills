@@ -180,9 +180,25 @@ so a client can render the spread (boxplot/violin/etc.):
 ```json
 "score_distribution": {
   "values": [0.0, 0.67, 1.0, ...],
-  "min": 0.0, "q1": 0.67, "median": 1.0, "q3": 1.0, "max": 1.0
+  "n": 34, "zero": 10, "perfect": 21,
+  "min": 0.0, "q1": 0.0, "median": 1.0, "q3": 1.0, "max": 1.0
 }
 ```
+
+**Compute the quartiles by NEAREST RANK, never by interpolation, and always record the counts.**
+Both halves of that matter, and a real run demonstrated why:
+
+- **Interpolated quartiles invent values the metric cannot produce.** A ground-truth F1 over set
+  overlap yields a small discrete set of per-case values (0.0, 0.667, 0.8, 1.0). Linear interpolation
+  between the 9th and 10th sorted values reported `q1 = 0.1667` — a number **no datapoint scored**,
+  presented as if it were a measurement. Pick the value at the nearest rank instead, so every number
+  in the summary is a score some case actually got.
+- **Quartiles alone go blind on a near-binary metric.** With 26 of 34 cases at exactly 1.0,
+  `q1 = median = q3 = 1.0` and the boxplot is a flat line — while the distribution had in fact moved
+  hard (cases scoring 0.0 fell 10 → 5). `n`/`zero`/`perfect` are the counts that carry that signal:
+  `zero` = cases scoring exactly 0.0, `perfect` = cases scoring exactly 1.0, `n` = cases scored. On a
+  metric like this they are the *only* informative part of the summary, so they are required, not
+  optional.
 
 `values` is the list of per-datapoint `score`s from that iteration's `eval_results.jsonl` (the
 last run's scored datapoints); `min`/`q1`/`median`/`q3`/`max` are computed from it. No new eval
@@ -196,10 +212,10 @@ That is fine — the distribution answers "how were the points spread within a r
 vs. split perfect/zero), not "how noisy is the mean across runs", which is what `stdev`/`run_means`
 already answer. Do not present it as the distribution of the reported score.
 
-The **five-number summary is also published to LLM-Obs** on that iteration's metric as `dist_*` tags
-(see the distribution tags under **Report each iteration's score to LLM-Obs**), so the spread travels
-with the score instead of living only on disk. `values` stays local — the per-datapoint array is too
-large for a tag list; the experiment event carries the summary, `config.json` carries the raw scores.
+The **summary is also published to LLM-Obs** on that iteration's metric as `dist_*` tags (see the
+distribution tags under **Report each iteration's score to LLM-Obs**), so the spread travels with the
+score instead of living only on disk. `values` stays local — the per-datapoint array is too large for
+a tag list; the experiment event carries the summary, `config.json` carries the raw scores.
 
 ## Scope — optimize the whole selected surface, not just the prompt
 
@@ -431,10 +447,10 @@ now** (amend the Step 2 commit or add a new one) so a single commit contains the
 eval-metric datapoint with `score_value` = the **final** `before_score` (the re-run mean if `runs`
 was raised, else the pilot mean) and tags `["iteration:0",
 "git.commit.sha:<baseline_commit_sha>", "decision:baseline"]` plus `basis:baseline`,
-`time_start`/`time_end`, and the five `dist_*` tags (the baseline has a computed score, so it
-carries its five-number summary too). **Iteration 0 omits `delta_vs_best`, `t_stat` and
-`significant`** — there is no previous best to compare against and no t-test was run, so there is
-no honest value for them; emitting `delta_vs_best:0` or `significant:false` would be inventing a
+`time_start_ms`/`time_end_ms`, and the eight `dist_*` tags (the baseline has a computed score, so it
+carries its distribution summary too). **Iteration 0 omits `delta_vs_best`, `delta_sign`, `t_stat`
+and `significant`** — there is no previous best to compare against and no t-test was run, so there
+is no honest value for them; emitting `delta_vs_best:0` or `significant:false` would be inventing a
 comparison that never happened. Absent is correct. The sha is the **full 40-character**
 hash of that just-committed final-baseline commit (`git rev-parse HEAD`), and the score must match
 the `before_score` every downstream iteration gates against. Same call shape and rules as **Report
@@ -577,6 +593,18 @@ Call `submit_llmobs_experiment_events` with a single metric shaped exactly like 
     `<decision>` is this iteration's keep/discard decision recorded in `iteration_results` (`kept` or
     `discarded`; `baseline` for iteration 0; `no_change` for an iteration whose feasibility probe or
     harness produced no measured score — see **No-change iterations** below).
+  - ⚠️ **Datadog NORMALIZES tag values — encode accordingly.** Tag values are lowercased and some
+    characters are rewritten, so a tag is **not** a byte-faithful channel. Two rules follow, both
+    learned from inspecting really-ingested events rather than from review:
+    - **Never put a leading `+` in a tag value.** It is rewritten to `_`: a tag sent as
+      `delta_vs_best:+0.0447` lands as `delta_vs_best:_0.0447`. The sign — the entire point of a
+      delta — is destroyed. Worse, `-` *survives*, so negatives would land as `-0.1180` while
+      positives land as `_0.1180`, an asymmetric encoding a consumer has to reverse-engineer.
+    - **Never put case-sensitive text in a tag value.** `time_start:2026-07-22T14:31:07Z` lands as
+      `...t14:31:07z`, which is no longer valid ISO-8601 and no longer byte-matches the
+      `iteration_results` row.
+    Keep the faithful values in `config.json`; put only normalization-safe forms in tags (unsigned
+    decimals, integers, lowercase enums, epoch millis).
   - **Decision-legibility tags (required on every scored iteration).** `score_value` alone hides
     *how much to trust the move*: a `kept` best can be either a solid, significant gain or a
     within-noise wobble that was kept only because the point estimate rose — a raw number cannot
@@ -592,28 +620,43 @@ Call `submit_llmobs_experiment_events` with a single metric shaped exactly like 
       `audit_failed` = discarded, the mechanism audit failed (e.g. the denominator shrank) so the
       higher mean is an artifact — regardless of the point estimate; `promoted` = a `within_noise`
       best later confirmed `significant` at higher power).
-    - `delta_vs_best:<±X.XXXX>` — the delta against the **previous best** (the number the decision
-      uses), NOT vs baseline.
+    - `delta_vs_best:<X.XXXX>` (**absolute value, no sign character**) plus
+      `delta_sign:<pos|neg|zero>` — the delta against the **previous best** (the number the decision
+      uses), NOT vs baseline. The sign is a separate tag because a leading `+` does not survive tag
+      normalization (see the warning above); splitting it keeps the magnitude filterable and the
+      direction unambiguous in both directions. `delta_sign` is arithmetic (`after − best`), so on a
+      minimize goal an improvement is `neg` — read improvement off `basis:`/`decision:`, not the sign.
     - `t_stat:<value>` (or `t_stat:null` when `se_diff == 0`) and `significant:<true|false>` — for a
       `within_noise` best, `significant:false` is what flags the kept score as low-confidence.
-    - These three (`delta_vs_best`, `t_stat`, `significant`) describe a **comparison against the
-      previous best**, so they apply only to an iteration that made one. **Iteration 0 omits all
-      three** (no previous best, no t-test) — see Step 2.4.
-    - `time_start:<iso>` and `time_end:<iso>` — this iteration's ISO-8601 UTC wall-clock start/end,
-      copied verbatim from the `iteration_results` row (see **Per-iteration timing** above) so the
-      experiment view can show per-iteration duration. Must match the row exactly; never fabricate.
+    - These four (`delta_vs_best`, `delta_sign`, `t_stat`, `significant`) describe a **comparison
+      against the previous best**, so they apply only to an iteration that made one. **Iteration 0
+      omits all four** (no previous best, no t-test) — see Step 2.4.
+    - `time_start_ms:<epoch_millis>` and `time_end_ms:<epoch_millis>` — this iteration's wall-clock
+      start/end as **integer epoch milliseconds**, so the experiment view can show per-iteration
+      duration. They must be the exact instants recorded as ISO-8601 in the `iteration_results` row
+      (see **Per-iteration timing**), just expressed as millis; never fabricate or round to a
+      different instant. Epoch millis rather than ISO because tag normalization lowercases the `T`
+      and `Z` of an ISO string, leaving a value that neither parses as ISO-8601 nor byte-matches the
+      row — integers pass through untouched.
   - **Distribution tags (required on every iteration that has a computed score).** `score_value` is
     a single mean — it hides whether the iteration scored uniformly well or split into perfect and
     zero datapoints, which is the difference between "broadly better" and "traded one bucket for
-    another". Publish the five-number summary from the row's `score_distribution` (see
-    **Per-iteration score distribution**) as five tags, each rounded to **4 decimal places**:
-    `dist_min:<X.XXXX>`, `dist_q1:<X.XXXX>`, `dist_median:<X.XXXX>`, `dist_q3:<X.XXXX>`,
-    `dist_max:<X.XXXX>` (e.g. `dist_q1:0.6667`). Copy them from the `iteration_results` row —
-    the same numbers, computed from that iteration's `eval_results.jsonl`, never re-derived by hand
-    and never estimated. The `dist_*` prefix keeps them distinct from `min_delta`, which is the
-    keep/discard floor and unrelated to the score spread. The raw `values` array is **not** tagged
-    (35+ tags per event); it stays in `config.json`. **Omit all five on a `no_change` iteration** —
-    it has no computed distribution (see **No-change iterations**).
+    another". Publish the row's `score_distribution` (see **Per-iteration score distribution**) as
+    eight tags. Copy them from the `iteration_results` row — the same numbers, never re-derived by
+    hand and never estimated:
+    - **counts, as integers** — `dist_n:<int>`, `dist_zero:<int>`, `dist_perfect:<int>` (cases
+      scored, cases scoring exactly 0.0, cases scoring exactly 1.0).
+    - **nearest-rank five-number summary, 4 decimal places** — `dist_min:<X.XXXX>`,
+      `dist_q1:<X.XXXX>`, `dist_median:<X.XXXX>`, `dist_q3:<X.XXXX>`, `dist_max:<X.XXXX>`.
+
+    **The counts are not decoration — on a near-binary metric they are the only part that moves.**
+    A real run had 26 of 34 cases at exactly 1.0, which pins `q1 = median = q3 = 1.0` and makes the
+    quartiles look frozen across iterations, while `dist_zero` fell 10 → 5 and captured the actual
+    improvement. Publishing quartiles alone would have reported a flat distribution for a run whose
+    distribution changed substantially. The `dist_*` prefix keeps these distinct from `min_delta`, the
+    keep/discard floor, which is unrelated to the score spread. The raw `values` array is **not**
+    tagged (35+ tags per event); it stays in `config.json`. **Omit all eight on a `no_change`
+    iteration** — it has no computed distribution (see **No-change iterations**).
     **These summarize the last run's per-datapoint spread, not the sample behind `score_value`**
     (which is the mean across `runs` — see **Per-iteration score distribution**), so
     `dist_median` will not generally equal `score_value` and a consumer must not read them as
@@ -639,7 +682,7 @@ Example arguments for iteration 5 whose harness computed a score of `0.72`:
       "score_value": 0.72,
       "reasoning": "KEPT — significant (Δvs_best +0.048, t=3.1). Rewrote the retrieval query builder to include entity synonyms (targeting the 'missed-retrieval' census bucket); cleared the t-test (|t|≥2) and passed the mechanism audit.",
       "timestamp_ms": 1752430000000,
-      "tags": ["iteration:5", "git.commit.sha:33ec6e0959bd46b0ea9c337cf6a28a763d3eeb0a", "decision:kept", "basis:significant", "delta_vs_best:+0.0480", "t_stat:3.1", "significant:true", "time_start:2026-07-22T14:31:07Z", "time_end:2026-07-22T14:38:52Z", "dist_min:0.0000", "dist_q1:0.6667", "dist_median:1.0000", "dist_q3:1.0000", "dist_max:1.0000"]
+      "tags": ["iteration:5", "git.commit.sha:33ec6e0959bd46b0ea9c337cf6a28a763d3eeb0a", "decision:kept", "basis:significant", "delta_vs_best:0.0480", "delta_sign:pos", "t_stat:3.1", "significant:true", "time_start_ms:1753194667000", "time_end_ms:1753195132000", "dist_n:34", "dist_zero:5", "dist_perfect:26", "dist_min:0.0000", "dist_q1:1.0000", "dist_median:1.0000", "dist_q3:1.0000", "dist_max:1.0000"]
     }
   ]
 }
