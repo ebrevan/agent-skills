@@ -156,6 +156,7 @@ the run's state + audit trail):
   "domain_notes": [],
   "datadog_backend": "mcp",
   "backend_used": null,
+  "backend_version": null,
   "backend_fallback": false,
   "max_iterations": 2,
   "max_runs": 3,
@@ -279,17 +280,43 @@ per-call: a run is unambiguously "via MCP" or "via pup", so its provenance is ne
 backend actually used in `config.json` as `backend_used`, because two runs that reached different
 backends are not strictly comparable.
 
-| purpose | `mcp` | `pup` |
+| purpose | `mcp` | `pup` (verified on 1.8.0) |
 |---|---|---|
-| dataset records (previews + schema) | `get_llmobs_dataset_records` | `pup llm-obs datasets records --project-id P --dataset-id D` |
-| dataset records (untrimmed) | `get_llmobs_full_dataset_records` | `pup llm-obs datasets records-full --project-id P --dataset-id D` |
-| find traces for an `ml_app` | `search_llmobs_spans` | `pup llm-obs spans search` |
-| full trace tree | `get_llmobs_trace` | `pup llm-obs spans get-trace --trace-id T` |
-| span field inventory | `get_llmobs_span_details` | `pup llm-obs spans get-details --trace-id T` |
-| span content (`messages`) | `get_llmobs_span_content` | `pup llm-obs spans get-content --trace-id T --span-id S --field messages` |
-| expand a trace's spans | `expand_llmobs_spans` | `pup llm-obs spans expand --trace-id T` |
-| record run context / status | `update_llmobs_experiment` | `pup llm-obs experiments update --file payload.json` |
-| submit an iteration's score | `submit_llmobs_experiment_events` | `pup llm-obs experiments events submit --file payload.json` |
+| dataset records (previews + schema) | `get_llmobs_dataset_records` | `pup llm-obs datasets records --project-id P --dataset-id D` ✅ |
+| dataset records (untrimmed) | `get_llmobs_full_dataset_records` | `pup llm-obs datasets records-full --project-id P --dataset-id D` ✅ |
+| find traces for an `ml_app` | `search_llmobs_spans` | `pup llm-obs spans search --ml-app A --from 7d` ✅ (note: `--from` takes `7d`, **not** `now-7d`) |
+| full trace tree | `get_llmobs_trace` | `pup llm-obs spans get-trace --trace-id T` ❌ **HTTP 404** |
+| span field inventory | `get_llmobs_span_details` | `pup llm-obs spans get-details --trace-id T` ❌ **HTTP 404** |
+| span content (`messages`) | `get_llmobs_span_content` | `pup llm-obs spans get-content --trace-id T --span-id S --field messages` ❌ **HTTP 404** |
+| expand a trace's spans | `expand_llmobs_spans` | `pup llm-obs spans expand --trace-id T` ❌ **HTTP 404** |
+| record run context / status | `update_llmobs_experiment` | `pup llm-obs experiments update --file payload.json <EXPERIMENT_ID>` ⚠️ exits 1, write lands |
+| submit an iteration's score | `submit_llmobs_experiment_events` | `pup llm-obs experiments events submit --metrics '<json array>' <EXPERIMENT_ID>` ✅ |
+
+### 🚫 pup cannot serve a trace-derived data source
+
+The four `spans get-*` commands return **HTTP 404** from
+`/api/unstable/llm-obs-mcp/v1/trace/*` under API-key auth, while the MCP tools read the very same
+trace successfully (verified side by side on one trace id: MCP returned 36 spans, pup 404'd). This is
+a **pup gap, not a platform gap**. `spans search` works; only the per-trace drill-downs fail.
+(Untested hypothesis for why: those routes may require the OAuth session from `pup auth login`
+rather than `DD_API_KEY`/`DD_APP_KEY`. Do not state that as fact without checking.)
+
+Consequence — treat it as an intake constraint, not a mid-run surprise:
+
+- `datadog_backend: pup` supports **`local_dataset_path`** (no backend at all) and **`dataset_id`**.
+- `datadog_backend: pup` **cannot** serve **`trace_ids`** or **`ml_app`**, because Step 1 needs
+  `get-trace` / `get-details` / `get-content` to extract the `messages` field per the
+  messages-source guidance, and all three 404.
+- If the resolved config pairs `pup` with a trace-derived source, **STOP at the intake gate** and say
+  so plainly: the user picks `mcp`, or supplies a `dataset_id`/`local_dataset_path`. Do not silently
+  fall back to MCP (that would falsify the recorded provenance) and do not start a run that will die
+  in Step 1.
+
+**Version sensitivity — pin what you test against.** pup's CLI is not yet stable across minor
+versions: `experiments events submit` took `--file <path>` in 1.7.0 and takes `--metrics '<json
+array>'` in 1.8.0. Check `pup --version` and `pup agent schema` for the installed build rather than
+trusting this table's flags verbatim, and record the version in `config.json` alongside
+`backend_used`.
 
 **Read this table as a substitution rule for the whole file.** The steps below name MCP tools
 because that is the default backend; wherever one appears, it means *"this purpose, via the selected
@@ -309,9 +336,10 @@ appears to fail while succeeding:
   `data` is exactly the body the MCP tool returns. **Unwrap `.data`** before parsing; the record
   contents, order and field names are otherwise identical (verified side by side).
 - **`experiments update` and `experiments events submit` take the experiment id as a POSITIONAL
-  argument**, not a flag, and it does **not** belong in the payload:
-  `pup llm-obs experiments events submit --file payload.json <EXPERIMENT_ID>`, where `payload.json`
-  is `{"metrics": [ … ]}` — the `experiment_id` key the MCP tool wants is omitted.
+  argument**, not a flag, and it does **not** belong in the payload. On 1.8.0:
+  `pup llm-obs experiments events submit --metrics '[{…}]' <EXPERIMENT_ID>` — the metrics array is
+  passed inline and the `experiment_id` key the MCP tool wants is omitted. `experiments update` still
+  takes `--file <path> <EXPERIMENT_ID>`.
 - ⚠️ **A non-zero pup exit does NOT mean the write failed.** `experiments create` and
   `experiments update` currently fail while *deserializing the API's response* (`missing field
   config`, and `EOF while parsing a value` for update's empty body) and exit non-zero **after the
