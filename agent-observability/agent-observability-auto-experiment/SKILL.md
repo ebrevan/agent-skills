@@ -332,7 +332,7 @@ backend changes the transport, never what is reported. The tag-normalization rul
 the warning in the reporting section); do not assume a different client escapes differently until you
 have inspected an ingested event.
 
-**pup call mechanics, verified against pup 1.7.0** — get these wrong and the command fails or, worse,
+**pup call mechanics, verified against pup 1.8.0** — get these wrong and the command fails or, worse,
 appears to fail while succeeding:
 
 - **Reads are wrapped.** In agent mode pup emits `{"status": ..., "data": ..., "metadata": ...}` and
