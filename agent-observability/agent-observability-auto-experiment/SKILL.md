@@ -280,38 +280,24 @@ per-call: a run is unambiguously "via MCP" or "via pup", so its provenance is ne
 backend actually used in `config.json` as `backend_used`, because two runs that reached different
 backends are not strictly comparable.
 
-| purpose | `mcp` | `pup` (verified on 1.8.0) |
-|---|---|---|
-| dataset records (previews + schema) | `get_llmobs_dataset_records` | `pup llm-obs datasets records --project-id P --dataset-id D` ✅ |
-| dataset records (untrimmed) | `get_llmobs_full_dataset_records` | `pup llm-obs datasets records-full --project-id P --dataset-id D` ✅ |
-| find traces for an `ml_app` | `search_llmobs_spans` | `pup llm-obs spans search --ml-app A --from 7d` ✅ (note: `--from` takes `7d`, **not** `now-7d`) |
-| full trace tree | `get_llmobs_trace` | `pup llm-obs spans get-trace --trace-id T --from 7d --to now` ✅ |
-| span field inventory | `get_llmobs_span_details` | `pup llm-obs spans get-details --trace-id T --span-ids S --from 7d --to now` ✅ |
-| span content (`messages`) | `get_llmobs_span_content` | `pup llm-obs spans get-content --trace-id T --span-id S --field messages --from 7d --to now` ✅ |
-| expand a trace's spans | `expand_llmobs_spans` | `pup llm-obs spans expand --trace-id T --span-ids S --from 7d --to now` ✅ |
-| record run context / status | `update_llmobs_experiment` | `pup llm-obs experiments update --file payload.json <EXPERIMENT_ID>` ⚠️ exits 1, write lands |
-| submit an iteration's score | `submit_llmobs_experiment_events` | `pup llm-obs experiments events submit --metrics '<json array>' <EXPERIMENT_ID>` ✅ |
+| purpose | `mcp` tool | `pup llm-obs …` subcommand | |
+|---|---|---|---|
+| dataset records (previews + schema) | `get_llmobs_dataset_records` | `datasets records --project-id P --dataset-id D` | |
+| dataset records (untrimmed) | `get_llmobs_full_dataset_records` | `datasets records-full --project-id P --dataset-id D` | |
+| find traces for an `ml_app` | `search_llmobs_spans` | `spans search --ml-app A` | ⏱ |
+| full trace tree | `get_llmobs_trace` | `spans get-trace --trace-id T` | ⏱ |
+| span field inventory | `get_llmobs_span_details` | `spans get-details --trace-id T --span-ids S` | ⏱ |
+| span content (`messages`) | `get_llmobs_span_content` | `spans get-content --trace-id T --span-id S --field messages` | ⏱ |
+| expand a trace's spans | `expand_llmobs_spans` | `spans expand --trace-id T --span-ids S` | ⏱ |
+| record run context / status | `update_llmobs_experiment` | `experiments update --file body.json <EXPERIMENT_ID>` | ⚠️ |
+| submit an iteration's score | `submit_llmobs_experiment_events` | `experiments events submit --metrics '[{…}]' <EXPERIMENT_ID>` | |
 
-### ⏱ pup's span commands default to a 1-hour window — always pass `--from`/`--to`
+Every pup row is prefixed `pup llm-obs` and every one was **run successfully against pup 1.8.0** —
+there are no unsupported purposes. Two markers:
 
-Every `pup llm-obs spans *` command defaults to `--from 1h`. A trace older than that returns
-**HTTP 404 with `{"detail": "no spans found for trace <id>"}"`** — which reads exactly like a missing
-route and is easy to misdiagnose as one. It is not: the routes serve fine, the window just excluded
-the trace. Pass an explicit window (`--from 7d --to now`) whenever you address a trace by id, and
-**read the whole error body** before concluding a command is unsupported; the 404's `detail` says
-precisely what happened.
-
-The MCP tools default to a wider window (`now-1d` for `get_llmobs_trace`), so the same trace id can
-succeed on MCP and 404 on pup purely from the default. That difference is a window, not a capability:
-all four per-trace commands were verified working under pup 1.8.0 with an explicit window, returning
-the same trace structure as MCP (36 spans on the same id). **pup can serve every data source the
-skill supports**, `trace_ids` and `ml_app` included.
-
-**Version sensitivity — pin what you test against.** pup's CLI is not yet stable across minor
-versions: `experiments events submit` took `--file <path>` in 1.7.0 and takes `--metrics '<json
-array>'` in 1.8.0. Check `pup --version` and `pup agent schema` for the installed build rather than
-trusting this table's flags verbatim, and record the version in `config.json` alongside
-`backend_used`.
+- ⏱ **pass an explicit `--from`/`--to`.** These default to a 1-hour window; see below.
+- ⚠️ **exits non-zero even when the write succeeds.** Verify by reading state back, not by exit
+  code; see the call mechanics below.
 
 **Read this table as a substitution rule for the whole file.** The steps below name MCP tools
 because that is the default backend; wherever one appears, it means *"this purpose, via the selected
