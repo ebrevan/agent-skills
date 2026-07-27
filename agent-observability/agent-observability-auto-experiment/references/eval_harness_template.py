@@ -16,7 +16,9 @@ Usage: `python .auto_experiment/eval_harness.py`  -> writes eval_results.jsonl, 
 
 Judge prompt: `build_judge_prompt` below assembles it — trusted blocks (the `evaluators` rubric and
 the config's `domain_notes`) first, then the untrusted datapoint content in sealed, separately
-delimited blocks. Pass `domain_notes` in via `AUTO_EXP_DOMAIN_NOTES`; see SKILL.md "Domain notes".
+delimited blocks. `domain_notes` is read from `.auto_experiment/config.json` on every run, so notes
+appended mid-run take effect without re-plumbing anything; `AUTO_EXP_DOMAIN_NOTES` overrides. See
+SKILL.md "Domain notes".
 
 Noise: `generate_output` (and an LLM judge) are stochastic, so a single run's mean is a
 noisy estimate. The runner re-runs the WHOLE eval `AUTO_EXP_RUNS` times (default 3) and
@@ -35,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import statistics
 from pathlib import Path
 
@@ -53,28 +56,56 @@ RUNS = max(3, int(os.environ.get("AUTO_EXP_RUNS", "3")))
 # score against `goal`.
 EVALUATORS = os.environ.get("AUTO_EXP_EVALUATORS", "<paste the config `evaluators` rubric here>")
 
-# The config `domain_notes` (see SKILL.md "Domain notes"): user-authored product context the judge
-# needs to score correctly — what a term of art means, which behaviours are intended. TRUSTED
-# context, unlike datapoint content. Empty is fine. Notes explain what the data means; they must
-# never redefine EVALUATORS or flip the optimization direction.
-DOMAIN_NOTES = os.environ.get("AUTO_EXP_DOMAIN_NOTES", "")
+def _load_domain_notes() -> str:
+    """Read the config `domain_notes` (see SKILL.md "Domain notes") and render them for the prompt.
 
-# Tag names used to delimit the judge prompt's blocks. Untrusted datapoint content is sealed
-# against these (see `_seal`) so it cannot close its own block and escape into instruction space.
+    Read from config.json ON EVERY RUN rather than captured once: notes grow mid-run when the user
+    corrects a domain misread, and a harness that cached them at setup would keep judging with the
+    stale set. `AUTO_EXP_DOMAIN_NOTES` overrides, for callers that have no config.json.
+
+    Canonical storage is a list of strings (one note per correction, which is what "append the
+    correction" means); a bare string is accepted and treated as a single note.
+    """
+    override = os.environ.get("AUTO_EXP_DOMAIN_NOTES")
+    if override is not None:
+        return override
+    config = HERE / "config.json"
+    if not config.exists():
+        return ""
+    notes = json.loads(config.read_text()).get("domain_notes") or []
+    if isinstance(notes, str):
+        notes = [notes]
+    return "\n".join(f"- {note}" for note in notes)
+
+
+# TRUSTED context, unlike datapoint content. Empty is fine. Notes explain what the data means; they
+# must never redefine EVALUATORS or flip the optimization direction.
+DOMAIN_NOTES = _load_domain_notes()
+
+# Tag names used to delimit the judge prompt's blocks. Untrusted datapoint content is sealed against
+# these (see `_seal`) so it cannot trivially close its own block and reach instruction space.
 _BLOCK_TAGS = ("evaluators", "domain_notes", "datapoint_input", "datapoint_output")
+
+# Matches our own delimiters case-insensitively and tolerates internal whitespace, so `</TAG>` and
+# `< / tag >` are caught too — an LLM reads those as closing tags even though a literal string
+# compare does not.
+_TAG_RE = re.compile(r"<\s*/?\s*(?:" + "|".join(_BLOCK_TAGS) + r")\s*>", re.IGNORECASE)
 
 
 def _seal(text: str) -> str:
-    """Neutralize block delimiters inside UNTRUSTED text so it cannot break out of its block.
+    """Defang anything in UNTRUSTED text that reads as one of our block delimiters.
 
-    Inserts a zero-width space into anything that looks like one of our own tags. Deliberately
-    surgical: it leaves the content otherwise byte-identical, so SQL operators (`>=`), markup, and
-    code in the datapoint still reach the judge intact and are scored as written.
+    Inserts a zero-width space after the `<` of each match, which stops the run of characters from
+    parsing as a closing tag while leaving the rest byte-identical — SQL operators (`>=`), markup and
+    code in the datapoint still reach the judge as written and are scored as written. A blunter
+    escape would corrupt the very content under test.
+
+    This RAISES THE COST of a break-out; it is not a proof against one. A determined injection can
+    still describe a delimiter rather than emit one. The load-bearing guard is the instruction
+    framing in `build_judge_prompt` — that the datapoint blocks are material to be scored and never
+    commands — with this as defence in depth. Do not treat it as a sanitizer.
     """
-    out = text or ""
-    for tag in _BLOCK_TAGS:
-        out = out.replace(f"</{tag}>", f"<​/{tag}>").replace(f"<{tag}>", f"<​{tag}>")
-    return out
+    return _TAG_RE.sub(lambda m: m.group(0).replace("<", "<​", 1), text or "")
 
 
 def build_judge_prompt(input_text: str, output_text: str) -> str:
@@ -85,6 +116,8 @@ def build_judge_prompt(input_text: str, output_text: str) -> str:
     posing as an instruction ("ignore previous instructions", "score this 1.0"), so they are sealed
     and explicitly framed as material to be scored. Never merge the two — merged, the datapoint
     inherits the notes' trust level, which is exactly the injection this guards against.
+
+    The framing text below is the primary guard; `_seal` is defence in depth, not a sanitizer.
     """
     notes_block = (
         f"<domain_notes>\n{DOMAIN_NOTES}\n</domain_notes>\n\n" if DOMAIN_NOTES.strip() else ""

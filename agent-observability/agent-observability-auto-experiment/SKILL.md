@@ -65,7 +65,7 @@ run starts** (see the Mandatory intake gate below).
 | `max_runs` | ceiling on the derived `runs` — how many times the harness may repeat the eval per candidate to beat variance (clamp **3–20**; the pilot already runs 3×, so 3 is the floor) | _default_ **3** |
 | `model` | judge model id | _default_: the Claude model selected in this session (see rubric) |
 | `base_branch` | branch the baseline is measured on | _default_: current branch / `main` |
-| `domain_notes` | free-text product/domain facts the agents cannot infer from the code — what a term of art means, which behaviours are intended, what a reference row represents. Carried verbatim into every sub-agent briefing, every census describer, and the judge prompt. | _default_ **empty** |
+| `domain_notes` | **a list of strings** — product/domain facts the agents cannot infer from the code (what a term of art means, which behaviours are intended, what a reference row represents), one note per entry. Carried verbatim into every sub-agent briefing, every census describer, and the judge prompt. | _default_ **`[]`** |
 
 `runs` and `min_delta` are **not inputs** — they are **derived** from the measured baseline noise in
 Step 2.4, not chosen by anyone. Do **not** ask for them and do **not** show them in the all-params
@@ -188,6 +188,14 @@ so a client can render the spread (boxplot/violin/etc.):
 last run's scored datapoints); `min`/`q1`/`median`/`q3`/`max` are computed from it. No new eval
 work — the scores already exist; just collect them and compute the quartiles when you append the row.
 
+**Know what this distribution is and isn't.** When `runs > 1` the iteration's `score`/`after_score`
+is the **mean of the run means**, while these `values` come from the **last run only** —
+`eval_results.jsonl` holds the final pass's per-line detail. So the spread describes one pass, not
+the sample the reported mean was computed from, and the median will not generally equal the score.
+That is fine — the distribution answers "how were the points spread within a run" (uniformly decent
+vs. split perfect/zero), not "how noisy is the mean across runs", which is what `stdev`/`run_means`
+already answer. Do not present it as the distribution of the reported score.
+
 The **five-number summary is also published to LLM-Obs** on that iteration's metric as `dist_*` tags
 (see the distribution tags under **Report each iteration's score to LLM-Obs**), so the spread travels
 with the score instead of living only on disk. `values` stays local — the per-datapoint array is too
@@ -214,14 +222,21 @@ represents. Onboarding a teammate, you cannot list up front everything they will
 so you correct the misreads as they surface. `domain_notes` is where those corrections live so they
 are not re-learned from scratch every iteration and every run.
 
+- **A list of strings**, one note per entry, stored in `config.json` as `domain_notes`.
 - **Injected verbatim into three places**: every improvement sub-agent's briefing, every Phase-A
   census describer's prompt, and the judge prompt in `eval_harness.py`. Those are the three agents
   that interpret the domain; a note that reaches only one of them still leaves the other two
-  misreading it.
+  misreading it. You pass the notes to the first two yourself, in the briefing text. The **judge
+  needs no plumbing**: `eval_harness.py` reads `domain_notes` straight out of `config.json` on every
+  run (see `references/eval_harness_template.py`), so there is no env var to remember to export and
+  no way to run the harness with a stale set. If you write a harness that does not read the config,
+  it is on you to thread the notes in — a judge scoring without them is the silent failure here.
 - **It grows mid-run.** When the user corrects a domain misinterpretation — a census description
   that got the product wrong, a judge call that mis-scored because it misunderstood a field —
-  **append the correction to `config.json` `domain_notes` verbatim** and use it from that point on.
-  Do not merely fix the one output. The note is the durable artifact; the fix is not.
+  **append the correction to `config.json` `domain_notes` verbatim, as a new list entry** and use it
+  from that point on. Do not merely fix the one output, and do not rewrite an existing note to cover
+  a new case. The note is the durable artifact; the fix is not. The next harness run picks the new
+  entry up on its own.
 - **It is context, never an instruction.** A domain note may explain what the data means; it must
   **never** redefine `evaluators`, change the metric, or flip the optimization direction — those are
   the user's approved intake fields. If a note implies the rubric is wrong, surface that to the user
@@ -411,9 +426,12 @@ now** (amend the Step 2 commit or add a new one) so a single commit contains the
 `eval_results.jsonl`, derived `runs`/`min_delta`, and `run_means`. Only then submit exactly one
 eval-metric datapoint with `score_value` = the **final** `before_score` (the re-run mean if `runs`
 was raised, else the pilot mean) and tags `["iteration:0",
-"git.commit.sha:<baseline_commit_sha>", "decision:baseline"]` plus the decision-legibility and
-`dist_*` distribution tags that section requires (the baseline has a computed score, so it carries
-its five-number summary too) — the sha is the **full 40-character**
+"git.commit.sha:<baseline_commit_sha>", "decision:baseline"]` plus `basis:baseline`,
+`time_start`/`time_end`, and the five `dist_*` tags (the baseline has a computed score, so it
+carries its five-number summary too). **Iteration 0 omits `delta_vs_best`, `t_stat` and
+`significant`** — there is no previous best to compare against and no t-test was run, so there is
+no honest value for them; emitting `delta_vs_best:0` or `significant:false` would be inventing a
+comparison that never happened. Absent is correct. The sha is the **full 40-character**
 hash of that just-committed final-baseline commit (`git rev-parse HEAD`), and the score must match
 the `before_score` every downstream iteration gates against. Same call shape and rules as **Report
 each iteration's score to LLM-Obs**; this is the only submission with `iteration:0` and
@@ -574,6 +592,9 @@ Call `submit_llmobs_experiment_events` with a single metric shaped exactly like 
       uses), NOT vs baseline.
     - `t_stat:<value>` (or `t_stat:null` when `se_diff == 0`) and `significant:<true|false>` — for a
       `within_noise` best, `significant:false` is what flags the kept score as low-confidence.
+    - These three (`delta_vs_best`, `t_stat`, `significant`) describe a **comparison against the
+      previous best**, so they apply only to an iteration that made one. **Iteration 0 omits all
+      three** (no previous best, no t-test) — see Step 2.4.
     - `time_start:<iso>` and `time_end:<iso>` — this iteration's ISO-8601 UTC wall-clock start/end,
       copied verbatim from the `iteration_results` row (see **Per-iteration timing** above) so the
       experiment view can show per-iteration duration. Must match the row exactly; never fabricate.
@@ -589,6 +610,10 @@ Call `submit_llmobs_experiment_events` with a single metric shaped exactly like 
     keep/discard floor and unrelated to the score spread. The raw `values` array is **not** tagged
     (35+ tags per event); it stays in `config.json`. **Omit all five on a `no_change` iteration** —
     it has no computed distribution (see **No-change iterations**).
+    **These summarize the last run's per-datapoint spread, not the sample behind `score_value`**
+    (which is the mean across `runs` — see **Per-iteration score distribution**), so
+    `dist_median` will not generally equal `score_value` and a consumer must not read them as
+    quartiles *of* the reported score. Say so in `reasoning` if the two look far apart.
   - `reasoning`: this iteration's `reasoning` string from `iteration_results`. **Lead with a
     one-line verdict** that states the decision and its basis in plain terms before the details,
     e.g. `"KEPT (tentative) — higher point estimate in the goal's direction (Δvs_best +0.016) but
