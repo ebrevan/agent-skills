@@ -282,7 +282,7 @@ backends are not strictly comparable.
 
 | purpose | `mcp` tool | `pup llm-obs …` subcommand | |
 |---|---|---|---|
-| **read the whole dataset** | `get_llmobs_dataset_records` (paged) | `datasets records-all --dataset-id D` | ★ |
+| **read the whole dataset** | ✗ no MCP tool can — see below | `datasets records-all --dataset-id D` | ★ |
 | browse a few records + schema | `get_llmobs_dataset_records --limit N` | `datasets records --project-id P --dataset-id D --limit N` | ⚠️ caps at ~19 |
 | untrimmed specific records | `get_llmobs_full_dataset_records` | `datasets records-full --record-ids "a,b,c"` | max 3 ids |
 | find traces for an `ml_app` | `search_llmobs_spans` | `spans search --ml-app A` | ⏱ |
@@ -306,14 +306,27 @@ there are no unsupported purposes. Two markers:
 
 Step 1 must materialize **every** scoreable record, and the two backends reach that differently:
 
-- **mcp** — `get_llmobs_dataset_records` returns `next_cursor`; page until it is empty.
 - **pup** — `pup llm-obs datasets records-all --dataset-id D [--limit N]`, which pages the REST
   route internally and returns the aggregate in one call. Needs no `--project-id`.
+- **mcp** — ⚠️ **no MCP tool can do this.** `get_llmobs_dataset_records` posts to the same
+  response-budget endpoint pup's capped `records` uses, and returns the same wall: verified at
+  `limit: 100` it gives `returned: 19, truncated: true, next_cursor: None`, with
+  `__nested_object__` placeholders. Its schema documents a `next_cursor`, but the server does not
+  populate one, so there is nothing to page with. `get_llmobs_full_dataset_records` caps at 3
+  records per call and needs the id list you cannot obtain.
 
-**Do NOT use `pup llm-obs datasets records` to load the corpus.** It posts to an MCP-token-budget
-endpoint that trims to a response-size budget — about **19 records** on a dataset with sizeable
-inputs — reports `truncated: true`, and returns **no cursor**, so the remainder is unreachable and
-`--cursor` has nothing to consume. A run built on that subset silently measures a different corpus
+  So on `mcp`, a dataset larger than ~19 records must be loaded by calling the REST route directly
+  (`GET /api/unstable/llm-obs/v1/datasets/{id}/records`, paging `meta.after`) — the same route pup
+  wraps. State plainly in `data_note` that the corpus came from a direct REST call rather than an
+  MCP tool, because that is a deviation from "every Datadog call went through the backend".
+  **If the dataset exceeds the cap and you want a single-client run, prefer `datadog_backend: pup`,
+  which is the only backend with a first-class command for this.**
+
+**Do NOT use `pup llm-obs datasets records` — or `get_llmobs_dataset_records` — to load the
+corpus.** Both post to the same response-budget endpoint, which trims to about **19 records** on a
+dataset with sizeable inputs, reports `truncated: true`, and returns **no cursor**, so the remainder
+is unreachable and the `cursor` parameter has nothing to consume. This is a property of the endpoint,
+not of either client. A run built on that subset silently measures a different corpus
 than an mcp run of the same `dataset_id`: different split, different class balance, no comparability.
 `records-full` is not a workaround either — it caps at 3 ids per call and needs the id list you
 cannot obtain.
