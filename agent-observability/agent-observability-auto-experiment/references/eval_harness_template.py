@@ -64,7 +64,10 @@ def _load_domain_notes() -> str:
     stale set. `AUTO_EXP_DOMAIN_NOTES` overrides, for callers that have no config.json.
 
     Canonical storage is a list of strings (one note per correction, which is what "append the
-    correction" means); a bare string is accepted and treated as a single note.
+    correction" means); a bare string is accepted and treated as a single note. Anything else is a
+    malformed config and raises with a legible message — silently rendering a dict's keys, or
+    crashing deep inside a join, would let a broken config reach the judge as plausible-looking
+    context and quietly change scores.
     """
     override = os.environ.get("AUTO_EXP_DOMAIN_NOTES")
     if override is not None:
@@ -72,9 +75,17 @@ def _load_domain_notes() -> str:
     config = HERE / "config.json"
     if not config.exists():
         return ""
-    notes = json.loads(config.read_text()).get("domain_notes") or []
+    try:
+        notes = json.loads(config.read_text()).get("domain_notes") or []
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"{config} is not valid JSON, cannot load domain_notes: {exc}") from exc
     if isinstance(notes, str):
         notes = [notes]
+    if not isinstance(notes, list) or not all(isinstance(note, str) for note in notes):
+        raise SystemExit(
+            f"config `domain_notes` must be a list of strings (or a single string), got "
+            f"{type(notes).__name__} — see SKILL.md 'Domain notes'"
+        )
     return "\n".join(f"- {note}" for note in notes)
 
 
@@ -82,8 +93,10 @@ def _load_domain_notes() -> str:
 # must never redefine EVALUATORS or flip the optimization direction.
 DOMAIN_NOTES = _load_domain_notes()
 
-# Tag names used to delimit the judge prompt's blocks. Untrusted datapoint content is sealed against
-# these (see `_seal`) so it cannot trivially close its own block and reach instruction space.
+# Tag names used to delimit the judge prompt's blocks. Every interpolated block — untrusted datapoint
+# content and the trusted notes alike — is sealed against these (see `_seal`) so nothing can trivially
+# close its own block and reach the framing text. Notes are sealed not because they are suspect but
+# because a note that quotes markup would otherwise break the prompt structure by accident.
 _BLOCK_TAGS = ("evaluators", "domain_notes", "datapoint_input", "datapoint_output")
 
 # Matches our own delimiters case-insensitively and tolerates internal whitespace, so `</TAG>` and
@@ -93,17 +106,18 @@ _TAG_RE = re.compile(r"<\s*/?\s*(?:" + "|".join(_BLOCK_TAGS) + r")\s*>", re.IGNO
 
 
 def _seal(text: str) -> str:
-    """Defang anything in UNTRUSTED text that reads as one of our block delimiters.
+    """Defang anything in a prompt block that reads as one of our block delimiters.
 
-    Inserts a zero-width space after the `<` of each match, which stops the run of characters from
-    parsing as a closing tag while leaving the rest byte-identical — SQL operators (`>=`), markup and
-    code in the datapoint still reach the judge as written and are scored as written. A blunter
-    escape would corrupt the very content under test.
+    Inserts a zero-width space after the `<` of each match, breaking the literal token while leaving
+    the rest byte-identical — SQL operators (`>=`), markup and code in the datapoint still reach the
+    judge as written and are scored as written. A blunter escape would corrupt the very content
+    under test.
 
-    This RAISES THE COST of a break-out; it is not a proof against one. A determined injection can
-    still describe a delimiter rather than emit one. The load-bearing guard is the instruction
-    framing in `build_judge_prompt` — that the datapoint blocks are material to be scored and never
-    commands — with this as defence in depth. Do not treat it as a sanitizer.
+    A model is not a parser, so this does NOT hard-stop a break-out: `<ZWSP/datapoint_input>` still
+    looks tag-shaped to an LLM, and content can describe a delimiter rather than emit one. It raises
+    the cost, nothing more. The load-bearing guard is the instruction framing in
+    `build_judge_prompt` — that the datapoint blocks are material to be scored and never commands —
+    with this as defence in depth. Do not treat it as a sanitizer.
     """
     return _TAG_RE.sub(lambda m: m.group(0).replace("<", "<​", 1), text or "")
 
@@ -111,16 +125,25 @@ def _seal(text: str) -> str:
 def build_judge_prompt(input_text: str, output_text: str) -> str:
     """Assemble the judge prompt: trusted instruction blocks first, untrusted data blocks last.
 
-    The separation is the point. EVALUATORS and DOMAIN_NOTES are user-approved, so they carry
-    instruction-level trust. The datapoint blocks are external free text that may contain something
-    posing as an instruction ("ignore previous instructions", "score this 1.0"), so they are sealed
-    and explicitly framed as material to be scored. Never merge the two — merged, the datapoint
-    inherits the notes' trust level, which is exactly the injection this guards against.
+    The separation is the point, and trust here has two independent axes — do not conflate them:
+
+      * EVALUATORS is user-approved AND authoritative: it alone sets the scoring criteria.
+      * DOMAIN_NOTES is user-approved but NOT authoritative. It is trusted in the sense that it is
+        not adversarial input, so the judge may rely on it to understand what the data means — but
+        it cannot define, widen or override the criteria. Trusted-as-context, powerless-as-rubric.
+        That is why the prompt says to score ONLY against <evaluators>.
+      * The datapoint blocks are neither: external free text that may contain something posing as an
+        instruction ("ignore previous instructions", "score this 1.0"), so they are sealed and
+        explicitly framed as material to be scored.
+
+    Never merge the blocks — merged, the datapoint inherits the notes' trust level, which is exactly
+    the injection this guards against. Notes are sealed too, so a note that quotes markup cannot
+    accidentally close its own block and spill into the framing text.
 
     The framing text below is the primary guard; `_seal` is defence in depth, not a sanitizer.
     """
     notes_block = (
-        f"<domain_notes>\n{DOMAIN_NOTES}\n</domain_notes>\n\n" if DOMAIN_NOTES.strip() else ""
+        f"<domain_notes>\n{_seal(DOMAIN_NOTES)}\n</domain_notes>\n\n" if DOMAIN_NOTES.strip() else ""
     )
     return (
         "You are scoring one datapoint against a fixed rubric.\n\n"

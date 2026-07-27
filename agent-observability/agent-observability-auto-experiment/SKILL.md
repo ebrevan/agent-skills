@@ -242,10 +242,14 @@ are not re-learned from scratch every iteration and every run.
   the user's approved intake fields. If a note implies the rubric is wrong, surface that to the user
   as a question and let them decide; do not silently reconcile it.
 - **Trusted, but keep the delimiters.** `domain_notes` is user-authored, so it is trusted context —
-  unlike datapoint content, which stays untrusted (see **Security & data handling**). In the judge
-  prompt, put them in **separate** delimited blocks: notes as instructions-level context, datapoint
-  content as data to be scored. Never let the two blocks merge, or datapoint text inherits the trust
-  level of the notes.
+  unlike datapoint content, which stays untrusted (see **Security & data handling**). Trust has two
+  separate axes here, and conflating them is what produces a judge that scores against the notes:
+  `evaluators` is trusted **and authoritative** (it alone sets the criteria); `domain_notes` is
+  trusted but **not authoritative** (the judge may rely on it to understand what the data means, and
+  may never let it define or widen the criteria); datapoint content is neither. In the judge prompt
+  put each in its **own** delimited block, and never let two merge — merged, datapoint text inherits
+  the notes' trust level. Seal the notes' block too: not because notes are suspect, but because a
+  note quoting markup would otherwise close its own block by accident.
 
 ## Setup
 
