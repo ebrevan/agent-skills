@@ -174,8 +174,8 @@ iteration spans a pause, record the real elapsed times. A row therefore looks li
 `{"iteration": 2, "decision": "kept", ..., "time_start": "...Z", "time_end": "...Z"}`.
 
 **Per-iteration score distribution.** Every `iteration_results` row (including iteration 0) records
-a `score_distribution` — the per-datapoint scores for that iteration plus their five-number summary,
-so a client can render the spread (boxplot/violin/etc.):
+a `score_distribution` — the per-datapoint scores for that iteration, their counts, and their
+five-number summary, so a client can render the spread (boxplot/violin/etc.):
 
 ```json
 "score_distribution": {
