@@ -1,7 +1,35 @@
 # Replay a trace against local code — details & rationale
 
-Read this before generating the runner. It covers the artifacts, the correlation/polling mechanism, the
-diff, and the known limitations.
+Read this before generating the runner. It covers the trace-access backend, the artifacts, the
+correlation/polling mechanism, the diff, and the known limitations.
+
+## Trace-access backend (MCP or pup)
+
+The skill reads traces through one of two backends; every other step is backend-agnostic:
+
+| operation | MCP backend | pup backend |
+|---|---|---|
+| fetch a trace | `get_llmobs_trace` | `pup llm-obs spans get-trace --trace-id <id>` |
+| read span output | `get_llmobs_span_content` | `pup llm-obs spans get-content` |
+| poll for the replay | `search_llmobs_spans` | `pup llm-obs spans search` |
+
+Prefer the **MCP** (richest — structured tree, `content_info`, a ready `trace_url`). Fall back to **pup**
+when the MCP isn't installed (`pup auth` must point at the app's org). If neither is available, guide the
+user to install the MCP (one `claude mcp add …?toolsets=llmobs` command — easier than pup's brew-install +
+`pup auth login`). Both the MCP and pup return a ready **`trace_url`** — use it verbatim (no construction).
+
+**pup exact usage** (verified against pup 1.8.0 — flags are non-obvious, got several wrong on first pass):
+- `pup llm-obs spans get-trace --trace-id <id> --from 30d` — `--trace-id` is a **flag**, not positional;
+  the default window is **1h**, so pass `--from` as a **bare duration** (`30d`/`7d`/`1h`) — `now-30d` is
+  rejected. Returns `total_duration_ms` and `trace_url`.
+- `pup llm-obs spans get-content --trace-id <id> --span-id <root-span-id> --field output` — span-id from
+  get-trace; `--field` is required (`input`/`output`/`messages`/…).
+- `pup llm-obs spans search --ml-app <app> --root-spans-only --from <t0> --query "replay_run_id:<id>"` — the
+  tag filter is a plain `key:value` in `--query`; the MCP-style `@replay_run_id:` matches **nothing**. Full
+  results already include each span's `output`, `tags`, and `trace_url`, so the poll can read the new
+  trace's output straight from the hit (no separate get-content needed).
+- Multi-org: add `--org <name>`, or make sure `pup auth` selected the app's org — a mismatched org returns a
+  bare `404 "no spans found"`, not an auth error.
 
 ## Two persistent artifacts (one-time setup, reused every iteration)
 
@@ -13,7 +41,7 @@ diff, and the known limitations.
    })
    ```
    Only `replay_input` + `replay_entrypoint` — **no `replay_output`**. The original trace already holds its
-   output; the diff reads outputs from the two traces via the MCP, so storing it would be redundant.
+   output; the diff reads outputs from the two traces via the backend, so storing it would be redundant.
 
 2. **The runner** (`replay_runner.py`) — a small CLI (not a server) with an `ENTRYPOINTS` dispatch table
    keyed by `replay_entrypoint`. The skill invokes it to re-run one entrypoint on a given input. Keep the
@@ -54,8 +82,10 @@ Two separate waits, keyed off the original trace's `total_duration_ms` (read via
 - **Runner subprocess timeout** = `max(120s, ~3 × total_duration_ms)`. The replay runs the same code, so it
   takes roughly the original duration; 3× catches a hung/stuck run without tripping on a normal one.
 - **Ingest poll** (after the runner returns): ingest lag is seconds-to-~2 min and does **not** scale with
-  duration, so poll **every ~5s up to a flat ~2 min**. Preferred: `search_llmobs_spans` for the
-  `replay_run_id` tag (from ≈ the replay launch time). Fallback: the **newest root span** for this `ml_app`
+  duration, so poll **every ~5s up to a flat ~2 min**. Preferred: search the backend for the `replay_run_id`
+  tag (from ≈ the replay launch time) — MCP `search_llmobs_spans` (`tags: {replay_run_id: <id>}`) or pup
+  `spans search --ml-app <app> --root-spans-only --from <t0> --query "replay_run_id:<id>"`.
+  Fallback: the **newest root span** for this `ml_app`
   + entrypoint created after launch. Treat "not found yet" as normal for the first attempts; on timeout
   **don't hard-fail** — tell the user it hasn't appeared yet and offer to keep waiting.
 
@@ -67,9 +97,8 @@ short; the developer is iterating fast. Call out that live-world drift (time, pr
 can change the output even when the code didn't — so not every diff is attributable to the code change.
 
 **Always lead the diff with clickable links to both traces**, so the developer can open either run in the
-UI. Use the **`trace_url` field the MCP returns** (`get_llmobs_trace`) **verbatim** — it's a ready-made
-deep link; do NOT hand-construct a `/llm/traces` URL (the correct query is `?query=trace_id:<id>`, not
-`@trace_id:` or the APM `?traceID=` convention):
+UI. **Both backends return a ready `trace_url`** (MCP `get_llmobs_trace`; pup `spans get-trace`/`search`) —
+use it **verbatim**; do NOT hand-construct a `/llm/traces` URL:
 ```
 - [Old trace](<old trace_url from get_llmobs_trace>)
 - [New trace](<new trace_url from get_llmobs_trace>)
@@ -102,8 +131,10 @@ the entrypoint can't be called with just JSON input (needs live infra built firs
   agent performs (DB, email, billing, queues) happen again. Warn before the first replay; the safe pattern
   (test doubles / dry-run mode / read-only creds in the replay path) is the user's responsibility.
 - **Ingest lag.** The "wait for the new trace" step is the loop's main latency, not the skill logic.
-- **Serializable input only.** Entrypoints needing non-serializable live infra rebuilt at replay are out of
-  scope — detect and ask, or skip that entrypoint.
+- **Not locally runnable → local setup.** If the app can't be invoked locally with a JSON input
+  (deployed-only service, HTTP/gRPC handler, live-infra deps), the skill sets up a local testing flow first
+  — see `references/local-setup.md` (detect → propose → build; hands back for secrets + the stub-vs-real
+  decision). Input still has to be JSON-serializable once the local path exists.
 - **Language.** The loop (fetch/edit/diff/MCP) is language-neutral, but the runner is generated in the app's
   language and the skill must know its build/run command. Python is first-class; compiled languages need a
   build step and more setup.

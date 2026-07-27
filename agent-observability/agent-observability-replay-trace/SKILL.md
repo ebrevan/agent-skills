@@ -7,8 +7,8 @@ description: >-
   /agent-observability-replay-trace <trace-id> [changes to test]. Signals: "replay this trace"; "iterate on
   a trace"; "this trace's output is wrong, fix it and re-run"; "re-run trace <id> with <change>"; pasting a
   trace id from the Agent Observability UI with a description of what to fix. It fetches the trace via the
-  datadog-llmo MCP, edits code, re-runs the app to emit a NEW trace, and diffs the two — no local server,
-  no browser. For agents traced with ddtrace / LLM Obs (Python first-class), with JSON-serializable entry
+  datadog-llmo MCP (or the pup CLI as a fallback), edits code, re-runs the app to emit a NEW trace, and
+  diffs the two — no local server, no browser. For agents traced with ddtrace / LLM Obs (Python first-class), with JSON-serializable entry
   input. Do NOT use for: scored Experiments or the browser "Replay" button (that's
   agent-observability-replay-experiment), building an experiment from a dataset/CSV, writing evaluators,
   root-causing failed traces, or RUM/HTTP session replay.
@@ -51,10 +51,11 @@ that free-text as the instruction and act on it directly; don't follow up with a
 - **Traced with `ddtrace` / LLM Obs**, with an `ml_app` and a discoverable entrypoint. **Python is
   first-class**; other languages work in principle (the loop is language-neutral) but you must learn that
   language's build/run command and generate the runner in it.
-- **Entrypoint input JSON-serializable.** If the entrypoint needs non-serializable live infra rebuilt at
-  replay (DB/API clients, a `deps`/context object), the runner can't manufacture it — ask the user how, or
-  declare that entrypoint out of scope.
-- **Requires the `datadog-llmo` MCP** (step 0).
+- **Entrypoint input JSON-serializable.** The runner invokes the entrypoint with a JSON input.
+- **Locally runnable.** If the app can't be invoked locally with a JSON input — a deployed-only service, an
+  HTTP/gRPC handler entrypoint, or one needing live infra — the skill offers to **set up a local testing
+  flow** first (see `references/local-setup.md`); it still needs you for secrets and the stub-vs-real call.
+- **Needs a trace-access backend** — the `datadog-llmo` MCP (preferred) or the `pup` CLI (step 0).
 - **Credentials:** `DD_API_KEY` + `DD_SITE` + the agent's provider key(s). **Not** `DD_APP_KEY` — this
   replays into a plain trace, not an Experiment.
 - **Side effects:** replaying re-runs real code (real model spend + any real writes the agent does). See
@@ -69,10 +70,37 @@ it lightweight, drops the `DD_APP_KEY` requirement, and isn't limited to Python'
 
 ## Workflow
 
-### 0. Ensure the `datadog-llmo` MCP is available
-Discovery + diffing read traces via this MCP. Check for `mcp__datadog-llmo-mcp__*` (e.g.
-`get_llmobs_trace`, `search_llmobs_spans`). **If absent, stop and walk the user through installing it**
-(https://docs.datadoghq.com/bits_ai/mcp_server/setup/) and resume only once the tools appear.
+### 0. Ensure a trace-access backend (MCP preferred, pup fallback)
+The skill reads traces through a **trace-access backend** — the `datadog-llmo` MCP (preferred, richest) or
+the **pup CLI** as a fallback. Later steps say "fetch the trace / read span content / poll for spans"
+without caring which; the two backends map like this:
+
+| operation | MCP backend | pup backend |
+|---|---|---|
+| fetch a trace | `get_llmobs_trace` | `pup llm-obs spans get-trace --trace-id <id>` |
+| read span output | `get_llmobs_span_content` | `pup llm-obs spans get-content` |
+| poll for the replay | `search_llmobs_spans` | `pup llm-obs spans search` |
+
+**pup exact usage** (verified against pup 1.8.0 — the flags are non-obvious):
+- `pup llm-obs spans get-trace --trace-id <id> --from 30d` — `--trace-id` is a flag (not positional); the
+  default window is **1h**, so pass `--from` as a **bare duration** (`30d`, `7d`, `1h`) — `now-30d` is
+  rejected. Returns `total_duration_ms` and a ready `trace_url`.
+- `pup llm-obs spans get-content --trace-id <id> --span-id <root-span-id> --field output` — span-id comes
+  from get-trace.
+- `pup llm-obs spans search --ml-app <app> --root-spans-only --from <t0> --query "replay_run_id:<id>"` — the
+  tag filter is a plain `key:value` in `--query` (the MCP-style `@replay_run_id:` matches nothing). Full
+  results include each span's `output`, `tags`, and `trace_url`.
+- Add `--org <name>` (or ensure `pup auth` picked the app's org) — a mismatched org returns a bare
+  `404 "no spans found"`, not an auth error.
+
+Pick a backend, in order:
+1. If `mcp__datadog-llmo-mcp__*` tools are present → use the **MCP**.
+2. Else if `pup` is installed and `pup auth` points at the app's org → use **pup**.
+3. Else **guide the user to install the MCP** — it's the one-command option (easier than pup's
+   brew-install + `pup auth login`):
+   `claude mcp add --scope user --transport http "datadog-llmo-mcp" 'https://mcp.datadoghq.com/api/unstable/mcp-server/mcp?toolsets=llmobs'`
+   (pup stays a "use it if already present" fallback — don't send users to install it.) Resume once a
+   backend is available; do not proceed without one.
 
 ### 1. Parse the command
 `<trace-id>` (required) and an optional free-text modification (everything after the id). No modification →
@@ -80,8 +108,11 @@ reproduce/diff-only mode. Determine the `ml_app` from the project (`LLMObs.enabl
 `DD_LLMOBS_ML_APP`) or the trace; confirm if ambiguous.
 
 ### 2. Fetch the trace
-`get_llmobs_trace` (and span content as needed). Read the **root span's output** — this is the baseline for
-the diff — and its `metadata.replay_input` / `metadata.replay_entrypoint` if present.
+Fetch it via the backend (MCP `get_llmobs_trace` / pup `spans get-trace`), reading span content as needed
+(MCP `get_llmobs_span_content` / pup `spans get-content`). Read the **root span's output** — this is the
+baseline for the diff — and its `metadata.replay_input` / `metadata.replay_entrypoint` if present. Also note
+its `total_duration_ms` (drives the step 7 timeout) and its `trace_url` (both backends return one). (In pup
+mode the default window is 1h — pass `--from 30d` (bare duration, **not** `now-30d`) for older traces.)
 
 ### 3. Resolve the entrypoint + input
 - **Entrypoint:** if `metadata.replay_entrypoint` is present, use it as the dispatch id. If absent, **infer**
@@ -89,6 +120,14 @@ the diff — and its `metadata.replay_input` / `metadata.replay_entrypoint` if p
 - **Input:** if `metadata.replay_input` is present, use it. If absent, derive a **suggested** input from the
   trace (best-effort — the rendered prompt is lossy, so prefer the code signature) and have the user
   **confirm or edit** it.
+
+### 3.5. Ensure a local run path (only if the app isn't locally runnable)
+Replay re-runs the entrypoint **locally**. If the app can't be invoked locally with a JSON input — a
+deployed-only service, an HTTP/gRPC handler entrypoint, no local `__main__`/CLI, deps not installed, or it
+needs live infra — **read `references/local-setup.md` and follow it**: detect the gap, **propose** a local
+testing flow, get one approval, then build it (pausing only for secrets and the stub-vs-real decision).
+**Skip this step entirely** when a local run path already exists (e.g. the entrypoint is an importable
+function you can call). Only then continue.
 
 ### 4. Ensure the two persistent artifacts (one-time setup, reused every iteration)
 - **a) In-entrypoint annotation** — so future traces self-describe. If the entrypoint doesn't already
@@ -131,8 +170,10 @@ Two waits, keyed off the original trace's duration (`total_duration_ms`, read in
   runs the same code, so it takes roughly the original duration; 3× catches a hung/stuck run without
   tripping on a normal one.
 - **Ingest:** once the runner returns, tell the user **"waiting for the new trace to appear in Datadog…"**
-  and poll the MCP **every ~5s for up to ~2 min**: `search_llmobs_spans` for the `replay_run_id` tag (from
-  ≈ `t0`). If that tag isn't queryable, fall back to the **newest root span** for this `ml_app` +
+  and poll the backend **every ~5s for up to ~2 min** for the `replay_run_id` tag (from ≈ `t0`): MCP
+  `search_llmobs_spans` (`tags: {replay_run_id: <id>}`) or pup `spans search --ml-app <app>
+  --root-spans-only --from <t0> --query "replay_run_id:<id>"` (plain `key:value`, not `@`). If that tag
+  isn't queryable, fall back to the **newest root span** for this `ml_app` +
   entrypoint created after `t0`. Ingest lag is seconds-to-~2 min and does **not** scale with duration.
   **Don't hard-fail** on timeout: say it hasn't appeared yet and offer to keep waiting.
 
@@ -142,9 +183,8 @@ meaningful output differences, not the full span trees. Note that live-world dri
 results) can differ even with unchanged code.
 
 **Every diff view must start with clickable links to BOTH traces** so the developer can open either in the
-UI. Use the **`trace_url` the MCP returns** for each trace (from `get_llmobs_trace`) **verbatim** — do NOT
-hand-construct the URL (the correct query is `?query=trace_id:<id>`, not `@trace_id:` or the APM `?traceID=`
-convention, so building it yourself gets it wrong):
+UI. **Both backends return a ready `trace_url`** for each trace (MCP `get_llmobs_trace`; pup
+`spans get-trace`/`search`) — use it **verbatim**, do NOT hand-construct a `/llm/traces` URL:
 ```
 - [Old trace](<old trace_url from get_llmobs_trace>)
 - [New trace](<new trace_url from get_llmobs_trace>)
@@ -162,5 +202,7 @@ Re-present this gate after every replay until the user picks "stop here". Do not
 
 ## Reference
 - `scripts/replay_runner_template.py` — the runner to copy + fill. Read it first.
-- `references/details.md` — the annotation + runner contract, correlation-marker/polling, concise-diff
-  guidance, and scope/limitations. Read before generating the runner.
+- `references/details.md` — the trace-access backend (MCP or pup), the annotation + runner contract,
+  correlation-marker/polling, concise-diff guidance, and scope/limitations. Read before generating the runner.
+- `references/local-setup.md` — how to set up a local testing flow when the app isn't locally runnable
+  (step 3.5). Read only when that gap is detected.
