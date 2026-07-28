@@ -17,273 +17,133 @@ description: >-
 # Replay a trace against local code
 
 A fast **iteration loop** on a single production trace: take a trace whose output a developer didn't like,
-optionally change the code to fix it, **re-run that trace against their LOCAL code**, and show a concise
-diff of old vs new output — repeating until they're happy. It assumes nothing about the project's layout.
+optionally change the code, **re-run it against their LOCAL code**, and show a concise diff of old vs new
+output — repeating until they're happy. Assumes nothing about the project's layout.
 
-Invoked from the developer's coding agent (they paste a CTA from the Agent Observability UI):
-`/agent-observability-replay-trace <trace-id> [<changes to test>]`.
+Invoked from the developer's coding agent: `/agent-observability-replay-trace <trace-id> [<changes to test>]`.
+With no modification, do the replay + diff only (a reproduce/regression check), then offer to enter the loop.
 
-## The loop (what you're building each run)
-
-1. Fetch the trace and read its output (the baseline).
-2. If a change was requested, edit the local code to address it — **show the changes and get an OK before replaying**.
-3. **Replay**: re-run the entrypoint locally so it emits a **new trace**.
-4. Wait for the new trace, then show a **concise diff** of old vs new output.
-5. Satisfied → done. Not satisfied → the developer says what's still wrong → back to step 2. Iterate.
-
-With **no** modification (`/agent-observability-replay-trace <trace-id>`): do the replay + diff only (a
-reproduce/regression check), then offer to enter the edit loop.
+**This file is the workflow spine — terse on purpose. The depth lives in `references/details.md` (trace
+backend + pup flags, the runner contract, export mode, polling, the trace-link scoping fix) and
+`references/local-setup.md` (making a deployed-only app locally runnable). Read `details.md` before you touch
+pup or generate the runner.**
 
 ## Interaction model — selector gates, never a hard stop
 
-This is a live loop. At every decision point, present the choices as an **interactive selector** (the
-`AskUserQuestion` tool — the same menu style as plan mode), **not** a plain question that ends your turn.
-There are two gates: (a) after you **propose code changes**, before replaying; and (b) after **each diff
-view**. Keep re-presenting the selector after every replay until the user explicitly chooses to finish —
-do not stop mid-loop. Only end when they pick "Looks good — stop here".
+This is a live loop. At every decision point present the choices as an **`AskUserQuestion` selector** (the
+plan-mode-style menu), not a plain question that ends your turn. Two gates: (a) after you propose code
+changes, before replaying; (b) after each diff. The selector's free-text option lets the user type detail
+(what to refine) inline — act on it directly, don't ask a follow-up. Keep re-presenting after every replay
+until they pick "stop here".
 
-The selector always offers a **free-text option**, so when a choice needs detail (what to refine, what to
-adjust), the user types it **right in the selector** — you get their description in the same view. Treat
-that free-text as the instruction and act on it directly; don't follow up with a separate question.
+## Scope — check first
 
-## Scope — check this first
-
-- **Traced with `ddtrace` / LLM Obs**, with an `ml_app` and a discoverable entrypoint. **Python is
-  first-class**; other languages work in principle (the loop is language-neutral) but you must learn that
-  language's build/run command and generate the runner in it.
-- **Entrypoint input JSON-serializable.** The runner invokes the entrypoint with a JSON input.
-- **A callable seam.** Not the binary "is the app locally runnable?" — ask **what is the innermost callable
-  seam corresponding to the trace's root span, and can it be called directly with a JSON input?** A
-  deployed-only HTTP/gRPC service often still exposes a plain callable underneath its handler (the common
-  ports-and-adapters / hexagonal case) — full local-setup would be overkill, but "already runnable" is also
-  wrong. Only when no seam can be called directly — truly deployed-only, or one needing live infra — does the
-  skill offer to **set up a local testing flow** first (see `references/local-setup.md`); it still needs you
-  for secrets and the stub-vs-real call.
-- **Needs a trace-access backend** — the `datadog-llmo` MCP (preferred) or the `pup` CLI (step 0).
-- **Credentials:** `DD_API_KEY` + `DD_SITE` + the agent's provider key(s). **Not** `DD_APP_KEY` — this
-  replays into a plain trace, not an Experiment.
-- **Side effects:** replaying re-runs real code (real model spend + any real writes the agent does). See
-  step 6 — warn before the first replay.
-
-## Why trace-only (not an Experiment)
-
-This is deliberately **not** the Experiments path (that's `agent-observability-replay-experiment`). Re-running
-the app just emits a normal new trace; the comparison is an LLM diff of the two traces' outputs. This keeps
-it lightweight, drops the `DD_APP_KEY` requirement, and isn't limited to Python's Experiments SDK. Details in
-`references/details.md` — read it before generating the runner.
+- **Traced with `ddtrace` / LLM Obs** (an `ml_app` + a discoverable entrypoint). **Python is first-class**;
+  other languages work but you write the runner to the contract in their SDK/build tooling.
+- **JSON-serializable entrypoint input**, and a **callable seam** for the root span (see step 3.5 — not a
+  binary "is it runnable?"; deployed-only apps often still expose a plain callable).
+- **A trace-access backend** — the `datadog-llmo` MCP (preferred) or `pup` (step 0).
+- **Credentials:** `DD_API_KEY` + `DD_SITE` + provider key(s). **Not `DD_APP_KEY`** — plain trace, not an
+  Experiment (that's `agent-observability-replay-experiment`).
+- **Side effects:** replaying re-runs real code (model spend + any real writes). Warn before the first replay.
 
 ## Workflow
 
-### 0. Ensure a trace-access backend (MCP preferred, pup fallback)
-The skill reads traces through a **trace-access backend** — the `datadog-llmo` MCP (preferred, richest) or
-the **pup CLI** as a fallback. Later steps say "fetch the trace / read span content / poll for spans"
-without caring which; the two backends map like this:
-
-| operation | MCP backend | pup backend |
-|---|---|---|
-| fetch a trace | `get_llmobs_trace` | `pup llm-obs spans get-trace --trace-id <id>` |
-| read span output | `get_llmobs_span_content` | `pup llm-obs spans get-content` |
-| poll for the replay | `search_llmobs_spans` | `pup llm-obs spans search` |
-
-**pup response shape (parse this, not the top level):** pup nests results under **`data.spans[]`**, and when
-it detects an AI agent it wraps the whole payload in `{status, data, metadata}` (its own `metadata.note`
-suggests `--no-agent` for scripts). Parsing the top level yields **zero hits on a trace that is actually
-ingested** — the single most dangerous failure here, because a wrong "0 spans" reads as a normal "not found"
-(see step 7). Pass `--no-agent` to stabilize the parse path, and always look under `data.spans[]`.
-
-**pup exact usage** (the flags are non-obvious, but this copy has drifted before — treat `pup <cmd> --help`
-and pup's own error text as the source of truth, and keep only the genuinely non-obvious bits below):
-- `pup llm-obs spans get-trace --trace-id <id> --from 30d` — `--trace-id` is a flag (not positional); the
-  default window is **1h**, so pass `--from` as a **bare duration** (`30d`, `7d`, `1h`) — `now-30d` is
-  rejected. Returns `total_duration_ms` and a ready `trace_url`. **Carry the `trace_id` forward — not the
-  `apm_trace_id`** that also appears in results; feeding `apm_trace_id` back into get-trace 404s.
-- `pup llm-obs spans get-content --trace-id <id> --span-id <root-span-id> --field output --from 30d` —
-  span-id comes from get-trace; `--field` is required. **get-content has the same 1h default window**, so
-  pass `--from` for older traces — a 404 `"span not found: <id>"` there is usually the **window**, not a bad
-  span id.
-- `pup llm-obs spans search --ml-app <app> --root-spans-only --from <t0> --query "replay_run_id:<id>"` — the
-  tag filter is a plain `key:value` in `--query` (the MCP-style `@replay_run_id:` matches nothing). Full
-  results include each span's `output`, `tags`, and `trace_url`.
-- Add `--org <name>` (or ensure `pup auth` picked the app's org) — a mismatched org returns a bare
-  `404 "no spans found"`, not an auth error.
-
-Pick a backend, in order:
-1. If `mcp__datadog-llmo-mcp__*` tools are present → use the **MCP**.
-2. Else if `pup` is installed and `pup auth` points at the app's org → use **pup**.
-3. Else **guide the user to install the MCP** — it's the one-command option (easier than pup's
-   brew-install + `pup auth login`):
-   `claude mcp add --scope user --transport http "datadog-llmo-mcp" 'https://mcp.datadoghq.com/api/unstable/mcp-server/mcp?toolsets=llmobs'`
-   (pup stays a "use it if already present" fallback — don't send users to install it.) Resume once a
-   backend is available; do not proceed without one.
+### 0. Ensure a trace-access backend
+Pick, in order: (1) MCP if `mcp__datadog-llmo-mcp__*` tools are present; (2) else `pup` if installed and
+`pup auth` targets the app's org; (3) else guide the **one-command MCP install** —
+`claude mcp add --scope user --transport http "datadog-llmo-mcp" '…?toolsets=llmobs'` (pup stays a
+use-if-present fallback, not something to install). Don't proceed without a backend.
+The backend↔operation mapping and **pup's exact flags/gotchas are in `details.md` — read that section before
+using pup.** The one pup thing you must not miss: parse results under **`data.spans[]`** with `--no-agent` —
+reading the top level returns **zero hits on an ingested trace**, a silent false negative (step 7).
 
 ### 1. Parse the command
-`<trace-id>` (required) and an optional free-text modification (everything after the id). No modification →
-reproduce/diff-only mode. Determine the `ml_app` from the project (`LLMObs.enable(ml_app=…)` /
-`DD_LLMOBS_ML_APP`) or the trace; confirm if ambiguous.
+`<trace-id>` + optional free-text modification (everything after the id); none → diff-only mode. Determine
+the `ml_app` from the project (`LLMObs.enable(ml_app=…)` / `DD_LLMOBS_ML_APP`) or the trace; confirm if
+ambiguous.
 
-### 2. Fetch the trace
-Fetch it via the backend (MCP `get_llmobs_trace` / pup `spans get-trace`), reading span content as needed
-(MCP `get_llmobs_span_content` / pup `spans get-content`). Read its `metadata.replay_input` /
-`metadata.replay_entrypoint` if present, note its `total_duration_ms` (drives the step 7 timeout) and its
-`trace_url` (both backends return one). (In pup mode the default window is 1h — pass `--from 30d` (bare
-duration, **not** `now-30d`) for older traces.)
+### 2. Fetch the trace + locate the baseline
+Fetch via the backend; note `total_duration_ms` (drives step 7), the `trace_url`, and
+`metadata.replay_input`/`replay_entrypoint` if present. **Locate the baseline field — it's not always the
+root output:** the value the developer dislikes may be a tool-call input or an intermediate output several
+levels deep, and the app may post-process it before the span records it. Pick the field the code change can
+actually move, or the delta drowns in noise.
 
-**Locate the baseline field — don't assume it's the root output.** The value the developer is dissatisfied
-with is often **not** the root span's output (which may be a summary/counter carrying nothing about the
-change) — it can be a tool-call **input** or an intermediate output several levels deep. Find the span
-field(s), at whatever depth, that actually express the complaint, and use those as the diff baseline. Also
-check whether the app **post-processes** that value between what the model produced and what the span
-records (e.g. appending deterministic boilerplate): if two plausible "before" values exist, pick the one the
-code change can actually move, or the delta drowns in noise.
-
-### 2.5. Check for fan-out before replaying the whole root
-If the root span **fans out into repeated sibling subtrees** (a batch/map that dispatches N parallel
-sub-runs), the change under test is usually visible in a **single** representative branch. Replaying the
-whole root then costs ~N× the model spend and wall-clock for no extra signal. Surface the fan-out and offer
-to replay one representative branch instead of the entire root; **log what you skipped** (consistent with
-the skill's "no silent caps" instinct). Only replay the full root if the change is inherently cross-branch.
+### 2.5. Check for fan-out
+If the root span **fans out into repeated sibling subtrees** (a batch/map over N parallel sub-runs), the
+change under test is usually visible in a **single** branch — replaying the whole root costs ~N× spend and
+time for no extra signal. Offer to replay one representative branch; **log what you skipped**. Full root only
+if the change is inherently cross-branch.
 
 ### 3. Resolve the entrypoint + input
-- **Entrypoint:** if `metadata.replay_entrypoint` is present, use it as the dispatch id. If absent, **infer**
-  the entrypoint from the root span (name/kind) + code and **ask the user to confirm** before proceeding.
-- **Input:** if `metadata.replay_input` is present, use it. If absent, derive a **suggested** input from the
-  trace (best-effort — the rendered prompt is lossy, so prefer the code signature) and have the user
-  **confirm or edit** it.
+- **Entrypoint:** `metadata.replay_entrypoint` if present; else infer from the root span (name/kind) + code
+  and **confirm with the user**.
+- **Input:** `metadata.replay_input` if present; else derive a **suggested** input (prefer the code
+  signature — the rendered prompt is lossy) and have the user **confirm/edit**.
 
 ### 3.5. Ensure a local run path (find the innermost callable seam)
-Replay re-runs the entrypoint **locally**. Resolve this by asking **"what is the innermost callable seam for
-this root span, and can I call it directly with JSON?"** — not the binary "is the app runnable?":
-- **Seam already directly callable** (an importable function you can call) → **skip this step**, continue.
-- **Seam buried under a handler/service** (deployed-only HTTP/gRPC, no local `__main__`/CLI, deps not
-  installed, live-infra coupling) → **read `references/local-setup.md` and follow it**: detect the gap,
-  **propose** a local testing flow, get one approval, then build it (pausing only for secrets and the
-  stub-vs-real decision).
+Ask **"what is the innermost callable seam for this root span, and can I call it directly with JSON?"** — not
+"is the app runnable?". Already directly callable → **skip, continue**. Buried under a handler/service
+(deployed-only, no local `__main__`, live-infra coupling) → follow **`references/local-setup.md`** (detect →
+propose → approve → build). The common middle case — a deployed service whose core logic is *already* a plain
+callable (ports-and-adapters) — just extract/call that seam; full local-setup is overkill.
 
-The middle case — a deployed service whose core logic is *already* a plain callable with local-dev seams —
-is the **normal** ports-and-adapters shape: extract/call that seam rather than running full local-setup.
-
-### 4. Ensure the two persistent artifacts (one-time setup, reused every iteration)
-- **a) In-entrypoint annotation** — so future traces self-describe. If the entrypoint doesn't already
-  annotate its root span, add it (best-effort, non-destructive):
+### 4. Ensure the two persistent artifacts (one-time setup)
+- **a) In-entrypoint annotation** on the app's **real** entrypoint, so all future traces (production too)
+  self-describe:
   ```python
-  LLMObs.annotate(span=span, metadata={
-      "replay_entrypoint": "<stable id for this type>",
-      "replay_input": <input extractor>,   # e.g. {"tickers": tickers}
-  })
+  LLMObs.annotate(span=span, metadata={"replay_entrypoint": "<stable id>", "replay_input": <extractor>})
   ```
-  (No `replay_output` — the original trace is the baseline; the diff reads outputs from the traces.)
-- **b) The runner** — a small CLI that satisfies the **language-independent runner contract** in
-  `references/details.md` (load env → derive `<ml_app>-local` → dispatch one entrypoint on JSON input →
-  **flush on every exit path, including errors** → print the `-local` ml_app). For **Python**, copy
-  `scripts/replay_runner_template.py` → `replay_runner.py` and fill its **`ENTRYPOINTS` dispatch table** (one
-  entry per type, keyed by `replay_entrypoint` → function + sync/async). For **other languages, write the
-  runner to the same contract** — do not assume the Python template's API shape carries over (e.g. Go uses
-  `tracer.Start(WithLLMObsEnabled/WithLLMObsMLApp/WithLLMObsAgentlessEnabled)`, not `LLMObs.enable(...)`, and
-  needs an explicit flush before exit **on the error path too**, or a failed replay leaves no diffable trace;
-  the `DD_TAGS` correlation marker does carry across languages). Extend the table/dispatch when new
-  entrypoints appear; keep the file.
-  - **Run command:** infer it (venv/interpreter/build) from the project and **confirm it** with the user.
-    Follow the host repo's **build-file conventions** for the new source file — repos with generated build
-    metadata (Bazel/Gazelle, Pants, Buck, or a lockfile/manifest to regenerate) need that step or the runner
-    won't build. On a **transient dependency-fetch failure**, retry the build **once** before reporting a
-    break. If the entrypoint needs non-serializable live infra, ask how to build it or skip it.
-  - **Export mode:** check how the app ships spans before replaying. The Python template defaults to
-    agentless (`agentless_enabled=True`), which is what you want locally, but a service may be wired to a
-    local Agent sidecar. Prefer **agentless** for the replay. Pre-empt a benign gotcha: with agentless LLM
-    Obs on, the APM tracer may still dial `localhost:8126` and log `ERROR: lost N traces … connection
-    refused` — **harmless** (LLM Obs spans ship independently and arrive fine); flag it so it isn't mistaken
-    for a failed replay (it compounds the false-negative in step 7).
+  No `replay_output` — the original trace is the baseline.
+- **b) The runner** — satisfies the **language-independent runner contract in `details.md`** (load env →
+  derive `<ml_app>-local` → dispatch one entrypoint on JSON → **flush on every exit path incl. errors** →
+  print the `-local` ml_app). **Python:** copy `scripts/replay_runner_template.py` and fill `ENTRYPOINTS`.
+  **Other languages:** write to the contract — don't assume the Python API carries over (see the Go notes +
+  export-mode gotchas in `details.md`). Infer + **confirm the run command**, and follow the host repo's
+  **build-file conventions** for the new file (Bazel/Gazelle, lockfiles, …).
 
-### 5. (If a change was requested) edit the code, then gate on a selector
-Analyze the trace + the request, make the code changes, show the developer the diff of your changes, then
-present an `AskUserQuestion` **selector** (not a plain question) — e.g.:
-- **Replay now** — proceed to step 6.
-- **Adjust the changes first** — the user says what to adjust; edit again and re-present this gate.
-- **Cancel** — stop without replaying.
-Only replay on the "Replay now" choice.
+### 5. (If a change was requested) edit, then gate
+Make the code changes, show the developer the diff of your changes, then an `AskUserQuestion` selector:
+**Replay now** / **Adjust the changes first** / **Cancel**. Only replay on "Replay now".
 
 ### 6. Replay
-**Before the first replay, run an ambient-environment check and surface it (don't silently correct).** An
-ambient var in the shell can quietly reroute the replay so it doesn't match production — a fidelity gap that
-is **invisible in the diff**. Check for: a provider API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …) that
-could make the SDK **bypass the app's configured model gateway**, and ambient `DD_*` that could send the
-trace to a different org/site. The runner's `load_dotenv(override=True)` handles `DD_*`, but provider
-credentials change what the diff is *worth*, so **report what you found** and let the user decide.
-
-**Before the first replay, warn:** re-running executes the agent for real — model calls cost tokens and any
-external writes (DB/email/billing/queues) happen again. On confirmation, record the launch time `t0`, then
-invoke the runner with the entrypoint id + input (as a JSON file), passing a unique correlation marker as a
-span tag via the environment:
+Before the first replay: **warn** (re-running is real — model spend + real writes), and **check the ambient
+environment** and surface it — a provider key (`OPENAI_API_KEY`, …) or ambient `DD_*` in the shell can
+reroute the model gateway or telemetry so the replay doesn't match production, a fidelity gap **invisible in
+the diff**. Report what you found; let the user decide.
+On confirmation, record `t0` and run (marker in the env):
 ```
-DD_TAGS=replay_run_id:<unique-id> <python> replay_runner.py --entrypoint <id> --input-file <path>
+DD_TAGS=replay_run_id:<unique-id> <run cmd> --entrypoint <id> --input-file <path>
 ```
-The runner runs the entrypoint **directly — no wrapper span — so the replay trace looks identical to a
-normal run**, and the marker rides along as a tag on the emitted spans.
-
-**Local replays emit under `<ml_app>-local`** (the app's ml_app + `-local`) so they never pollute the
-production ml_app — the original trace stays under the real ml_app; the new one lands under `-local`. The
-runner does this automatically and prints the `-local` ml_app; poll for the new trace **under that name**.
+The runner emits **under `<ml_app>-local`** (idempotent, so replays never pollute production) and prints that
+name — poll for the new trace **under it**.
 
 ### 7. Wait for the new trace
-Two waits, keyed off the original trace's duration (`total_duration_ms`, read in step 2):
-- **Runner run:** give the runner subprocess a timeout of `max(120s, ~3 × total_duration_ms)` — the replay
-  runs the same code, so it takes roughly the original duration; 3× catches a hung/stuck run without
-  tripping on a normal one.
-- **Ingest:** once the runner returns, tell the user **"waiting for the new trace to appear in Datadog…"**
-  and poll the backend **every ~5s for up to ~2 min** for the `replay_run_id` tag (from ≈ `t0`), **under the
-  `<ml_app>-local` name** the runner printed (not the production ml_app): MCP `search_llmobs_spans`
-  (`ml_app: <ml_app>-local`, `tags: {replay_run_id: <id>}`) or pup `spans search --ml-app <ml_app>-local
-  --root-spans-only --from <t0> --query "replay_run_id:<id>"` (plain `key:value`, not `@`). If that tag
-  isn't queryable, fall back to the **newest root span** under `<ml_app>-local` for this entrypoint created
-  after `t0`. Ingest lag is seconds-to-~2 min and does **not** scale with duration.
-  **Sanity check before you ever report "not found":** re-query with **no tag filter** (just the
-  `<ml_app>-local` + time window) to distinguish "nothing ingested" from "my filter/parse is wrong." A
-  parse/scope mistake (e.g. reading pup's top level instead of `data.spans[]`, or polling the production
-  ml_app) produces a **confident false negative** — telling the user the replay never landed when it did,
-  which reads as normal and invites a wasteful re-run. If the unfiltered query returns spans, the problem is
-  your filter, not ingestion.
-  **Don't hard-fail** on timeout: say it hasn't appeared yet and offer to keep waiting.
+- **Runner subprocess timeout** = `max(120s, ~3 × total_duration_ms)`.
+- **Ingest poll:** after it returns, poll the backend **every ~5s up to ~2 min** for the `replay_run_id` tag
+  under `<ml_app>-local` (pup: `--query "replay_run_id:<id>"`, plain `key:value`). **Before ever reporting
+  "not found," re-query with no tag filter** (just `<ml_app>-local` + window): if that returns spans, your
+  filter/parse/scope is wrong — **not** ingestion. A false "no trace" is the worst outcome (reads as normal,
+  invites a wasteful re-run). Don't hard-fail; offer to keep waiting.
 
-### 8. Summarize the diff (with links to both traces)
-Fetch the new trace and give a **concise** summary of how the **new output differs from the old** — just the
-meaningful output differences, not the full span trees. Note that live-world drift (time, prices, search
-results) can differ even with unchanged code. **When the edit targeted model-facing text** (a prompt, system
-message, or tool schema) rather than deterministic code, add that **model sampling variance is a separate
-confound**: a single replay can't separate "my change worked" from "this sample differed." Say plainly that
-n=1 is *suggestive, not conclusive*, and offer to replay 2–3 units (or the same unit twice) to tell them
-apart.
+### 8. Diff (with links to both traces)
+Concise summary of how the **new output differs from the old** — meaningful differences only. Note live-world
+drift; and if the edit targeted **model-facing text** (prompt/system/tool-schema), sampling variance makes
+n=1 *suggestive, not conclusive* — offer 2–3 replays. Lead the diff with both trace links:
+- **Old:** `trace_url` **verbatim**.
+- **New (replay):** must carry `ml_app=<ml_app>-local` or it opens **empty** — and the `trace_url` is an
+  org-switch wrapper (`…/switch_to_user/<id>?next=<encoded /llm/traces …>&flow=org_switch`), so **inject
+  `ml_app=<ml_app>-local` into the decoded `next` query and re-encode; do NOT append to the outer URL**
+  (mechanics in `details.md`). Browser-unverifiable from here — confirm once it opens non-empty.
 
-**Every diff view must start with clickable links to BOTH traces** so the developer can open either in the
-UI. Both backends return a ready `trace_url`, but there's one scoping trap:
-- **Old trace:** use its `trace_url` **verbatim** — do NOT hand-construct a `/llm/traces` URL.
-- **New (replay) trace:** the `trace_url` carries **no `ml_app`**, so opened as-is it scopes to whatever app
-  the user's picker last had (usually production) and renders **empty** — it must carry
-  `ml_app=<ml_app>-local`. **But the returned URL is an org-switch wrapper**
-  (`…/switch_to_user/<id>?next=<URL-encoded /llm/traces …>&flow=org_switch`) with the real `/llm/traces` path
-  encoded inside `next`. So **do NOT append `&ml_app=…` to the outer URL** — that lands after
-  `&flow=org_switch` on the `switch_to_user` endpoint, which ignores it and redirects to the decoded `next`
-  path (no ml_app). Instead: URL-**decode** the `next` value, add `ml_app=<ml_app>-local` to its
-  `/llm/traces` query, then re-encode `next` (keeping `&flow=org_switch`). If a backend ever returns a
-  **bare** `/llm/traces?…` URL (no wrapper), just add `&ml_app=<ml_app>-local` directly. *(This scoping can't
-  be verified from a coding agent — confirm the replay link opens non-empty in a browser once.)*
-```
-- [Old trace](<old trace_url — verbatim>)
-- [New trace](<new trace_url with ml_app=<ml_app>-local injected into the `next` path>)
-```
-The link text is just "Old trace" / "New trace". Then the diff summary.
-
-### 9. Iterate — gate on a selector (never a hard stop)
-After the diff, present an `AskUserQuestion` **selector** with two options (the tool also offers a free-text
-"Other"):
-- **Looks good — stop here** — finish; leave the code changes in the working tree for the user to review.
-- **Make more changes** — the user describes what to change **inline in the selector** (free-text); use
-  that description and go to step 5 (edit → gate → replay → diff). In diff-only mode, this is where the
-  first change is made.
-Re-present this gate after every replay until the user picks "stop here". Do not end your turn between iterations.
+### 9. Iterate — gate on a selector
+After the diff, an `AskUserQuestion` selector: **Looks good — stop here** (finish; leave the edits in the
+working tree) / **Make more changes** (free-text inline → back to step 5). Re-present after every replay;
+end only on "stop here".
 
 ## Reference
-- `scripts/replay_runner_template.py` — the runner to copy + fill. Read it first.
-- `references/details.md` — the trace-access backend (MCP or pup), the annotation + runner contract,
-  correlation-marker/polling, concise-diff guidance, and scope/limitations. Read before generating the runner.
-- `references/local-setup.md` — how to set up a local testing flow when the app isn't locally runnable
-  (step 3.5). Read only when that gap is detected.
+- `references/details.md` — trace backend + **pup exact flags**, the **runner contract** (+ Go, export mode),
+  polling + the false-negative sanity check, the **trace-link scoping fix**, limitations. Read before pup / the runner.
+- `references/local-setup.md` — making a deployed-only app locally runnable (step 3.5). Read when that gap shows.
+- `scripts/replay_runner_template.py` — the Python runner to copy + fill.
