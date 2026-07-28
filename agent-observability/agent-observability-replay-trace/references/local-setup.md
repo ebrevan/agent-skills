@@ -26,7 +26,8 @@ Read the code around the entrypoint and produce a concrete, reviewable plan cove
 - **The local entry point** you'll scaffold — a thin module that invokes the core agent logic with a JSON
   input (extracting a callable seam if the logic is buried inside a handler).
 - **Deps + venv** to create/install, and the **run command**.
-- **Env/config** to load locally (e.g. a `.env`), and **tracing** (`LLMObs.enable(ml_app=…)`).
+- **Env/config** to load locally (e.g. a `.env`), and **tracing** enabled under **`<ml_app>-local`**
+  (`LLMObs.enable(ml_app="<ml_app>-local")`) — local test traces must **not** pollute the production ml_app.
 - **Per external dependency**, your proposed handling: **stub / no-op**, **point at a local or test
   instance**, or **use real read-only creds** — one line each.
 - **Any structural edits** to the app (e.g. extracting the core function out of a handler), called out
@@ -40,7 +41,7 @@ This is their one control point — don't build before it.
 Do everything you can without further prompting:
 - Scaffold the local entry point that calls the core logic with the JSON input.
 - Extract the callable seam if needed (apply the structural edits you flagged).
-- Create the venv, install deps, write the local `.env` skeleton, enable `LLMObs`.
+- Create the venv, install deps, write the local `.env` skeleton, enable `LLMObs` under `<ml_app>-local`.
 - Wire external deps per the approved plan (stubs / local instances).
 
 Then hand off to **step 4** (instrument + runner) as normal — the runner's entrypoint becomes this local

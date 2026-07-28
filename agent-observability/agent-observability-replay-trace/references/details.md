@@ -67,9 +67,11 @@ DD_TAGS=replay_run_id:<marker> <python> replay_runner.py --entrypoint <id> --inp
 The runner:
 - loads `.env` with `override=True` (org-safety: ambient `DD_*` from a shell configured for the MCP can
   point at a different org),
+- enables `LLMObs` under **`<ml_app>-local`** (idempotent `+ "-local"`) so replay/test traces never pollute
+  the production ml_app,
 - runs the entrypoint **directly — no wrapper span** — so the replay trace is structurally identical to a
   normal run,
-- flushes and exits.
+- flushes and exits, printing the `-local` ml_app the caller should poll under.
 
 `DD_TAGS=replay_run_id:<marker>` makes ddtrace stamp the marker on every span of the run (the same channel
 that carries `git_commit_sha`, `env`, etc.), so the caller can locate the new trace by that tag **without
@@ -84,7 +86,7 @@ Two separate waits, keyed off the original trace's `total_duration_ms` (read via
 - **Ingest poll** (after the runner returns): ingest lag is seconds-to-~2 min and does **not** scale with
   duration, so poll **every ~5s up to a flat ~2 min**. Preferred: search the backend for the `replay_run_id`
   tag (from ≈ the replay launch time) — MCP `search_llmobs_spans` (`tags: {replay_run_id: <id>}`) or pup
-  `spans search --ml-app <app> --root-spans-only --from <t0> --query "replay_run_id:<id>"`.
+  `spans search --ml-app <ml_app>-local --root-spans-only --from <t0> --query "replay_run_id:<id>"`.
   Fallback: the **newest root span** for this `ml_app`
   + entrypoint created after launch. Treat "not found yet" as normal for the first attempts; on timeout
   **don't hard-fail** — tell the user it hasn't appeared yet and offer to keep waiting.

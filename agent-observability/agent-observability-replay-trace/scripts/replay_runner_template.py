@@ -30,6 +30,10 @@ from ddtrace.llmobs import LLMObs
 from {{MODULE}} import {{ENTRYPOINT_FN}}   # , {{ANOTHER_ENTRYPOINT_FN}}, ...
 
 ML_APP = os.environ.get("DD_LLMOBS_ML_APP", "{{ML_APP}}")
+# Local replays emit under "<ml_app>-local" (idempotent) so they never pollute the production ml_app's
+# traces — the original trace stays under the real ml_app; every replay lands under "-local".
+if not ML_APP.endswith("-local"):
+    ML_APP = ML_APP + "-local"
 LLMObs.enable(ml_app=ML_APP, agentless_enabled=True)
 
 
@@ -63,7 +67,8 @@ def main():
     _run_entrypoint(ENTRYPOINTS[args.entrypoint], input_data)
 
     LLMObs.flush()  # agentless: make sure the trace is sent before we exit
-    print(json.dumps({"status": "done", "entrypoint": args.entrypoint}))
+    # ml_app is the "-local" name the caller should poll under for the new trace.
+    print(json.dumps({"status": "done", "entrypoint": args.entrypoint, "ml_app": ML_APP}))
 
 
 if __name__ == "__main__":

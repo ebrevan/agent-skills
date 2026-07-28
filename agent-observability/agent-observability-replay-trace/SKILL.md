@@ -164,17 +164,22 @@ DD_TAGS=replay_run_id:<unique-id> <python> replay_runner.py --entrypoint <id> --
 The runner runs the entrypoint **directly — no wrapper span — so the replay trace looks identical to a
 normal run**, and the marker rides along as a tag on the emitted spans.
 
+**Local replays emit under `<ml_app>-local`** (the app's ml_app + `-local`) so they never pollute the
+production ml_app — the original trace stays under the real ml_app; the new one lands under `-local`. The
+runner does this automatically and prints the `-local` ml_app; poll for the new trace **under that name**.
+
 ### 7. Wait for the new trace
 Two waits, keyed off the original trace's duration (`total_duration_ms`, read in step 2):
 - **Runner run:** give the runner subprocess a timeout of `max(120s, ~3 × total_duration_ms)` — the replay
   runs the same code, so it takes roughly the original duration; 3× catches a hung/stuck run without
   tripping on a normal one.
 - **Ingest:** once the runner returns, tell the user **"waiting for the new trace to appear in Datadog…"**
-  and poll the backend **every ~5s for up to ~2 min** for the `replay_run_id` tag (from ≈ `t0`): MCP
-  `search_llmobs_spans` (`tags: {replay_run_id: <id>}`) or pup `spans search --ml-app <app>
+  and poll the backend **every ~5s for up to ~2 min** for the `replay_run_id` tag (from ≈ `t0`), **under the
+  `<ml_app>-local` name** the runner printed (not the production ml_app): MCP `search_llmobs_spans`
+  (`ml_app: <ml_app>-local`, `tags: {replay_run_id: <id>}`) or pup `spans search --ml-app <ml_app>-local
   --root-spans-only --from <t0> --query "replay_run_id:<id>"` (plain `key:value`, not `@`). If that tag
-  isn't queryable, fall back to the **newest root span** for this `ml_app` +
-  entrypoint created after `t0`. Ingest lag is seconds-to-~2 min and does **not** scale with duration.
+  isn't queryable, fall back to the **newest root span** under `<ml_app>-local` for this entrypoint created
+  after `t0`. Ingest lag is seconds-to-~2 min and does **not** scale with duration.
   **Don't hard-fail** on timeout: say it hasn't appeared yet and offer to keep waiting.
 
 ### 8. Summarize the diff (with links to both traces)
