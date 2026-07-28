@@ -63,6 +63,7 @@ run starts** (see the Mandatory intake gate below).
 | data source | where the eval data comes from — a **`local_dataset_path`** (a local `.jsonl`/`.csv` file on disk), **or** a `dataset_id`, **or** an `ml_app` to pull traces from (optionally narrowed by explicit `trace_ids`). | **must ask** — mandatory; the run cannot start without one of `local_dataset_path` / `dataset_id` / `ml_app` (priority below) |
 | `max_iterations` | how many changes to try (clamp **1–50**) | _default_ **2** |
 | `max_runs` | ceiling on the derived `runs` — how many times the harness may repeat the eval per candidate to beat variance (clamp **3–20**; the pilot already runs 3×, so 3 is the floor) | _default_ **3** |
+| `runtime` | which harness language to use (`python` \| `node`) — the harness must run in whatever can import/run `files_to_optimize` | _default_: **auto-detected** from `files_to_optimize` (see Step 2); the user may override |
 | `model` | judge model id | _default_: the Claude model selected in this session (see rubric) |
 | `base_branch` | branch the baseline is measured on | _default_: current branch / `main` |
 | `domain_notes` | **a list of strings** — product/domain facts the agents cannot infer from the code (what a term of art means, which behaviours are intended, what a reference row represents), one note per entry. Carried verbatim into every sub-agent briefing, every census describer, and the judge prompt. | _default_ **`[]`** |
@@ -160,6 +161,8 @@ the run's state + audit trail):
   "backend_fallback": false,
   "max_iterations": 2,
   "max_runs": 3,
+  "runtime": null,
+  "harness_path": null,
   "runs": null,
   "min_delta": null,
   "iteration_results": [],
@@ -562,11 +565,48 @@ Then **split once, deterministically** (hash of datapoint id, ~70/30) into
 (`AUTO_EXP_DATA=.auto_experiment/data.val.jsonl`); `test` is run only in the final report.
 
 ### Step 2 — Build the harness and compute BEFORE (baseline)
-Copy `references/eval_harness_template.py` to `.auto_experiment/eval_harness.py` and fill in
-`generate_output` (run the REAL code under test from `files_to_optimize`) and `judge`. **Prefer a
-deterministic ground-truth metric** (reference output / programmatic checker / pipeline count) and
-use an LLM-as-judge only when no ground truth exists — see the rubric's **Metric selection**. **No
-score literals anywhere.**
+
+**Pick the harness language to match the code under test (auto-detect, with override).** The loop is
+language-agnostic — it only reads the harness's stdout JSON contract — so the harness must be written
+in whatever runtime can import/run `files_to_optimize`. There are two templates: a Python one
+(`references/eval_harness_template.py`) and a Node/ESM one (`references/eval_harness_template.mjs`);
+both emit the identical JSON and honor the same env vars.
+
+- **Detect the runtime** from the edit scope, in this order: (1) if any file in `files_to_optimize`
+  is `.js`/`.ts`/`.mjs`/`.cjs`, or the nearest enclosing package manifest is a `package.json` →
+  **Node**; (2) if any is `.py`, or the manifest is `pyproject.toml`/`requirements.txt`/`setup.py` →
+  **Python**; (3) if the scope is language-neutral (e.g. a `.md` prompt file), fall back to the
+  language of the app whose entrypoint `generate_output`/`generateOutput` must call.
+- **Default to Python when the runtime is neither Node nor Python.** If the code under test is in
+  some other language (Go, Ruby, Rust, …), or the language can't be determined, use the **Python**
+  harness: it can drive any code-under-test out-of-process via `subprocess` (the language-agnostic
+  path — the harness spawns the real code and reads its stdout), so it is the safe general-purpose
+  default. The native Node harness is just the in-process convenience for Node/TS apps; everything
+  else goes through Python.
+- **Honor an explicit `runtime` override** if the user set one at intake. If detection is genuinely
+  ambiguous (e.g. both a `package.json` and a `pyproject.toml`/`requirements.txt` enclose the scope),
+  you may **ask the user** for `runtime` (`python` | `node`) rather than guess — but absent an
+  answer, default to **Python** per the rule above.
+
+Then copy the matching template and fill in the two functions (`generate_output`/`generateOutput`
+runs the REAL code under test from `files_to_optimize`; `judge` scores it):
+
+- **Python** → copy `references/eval_harness_template.py` to `.auto_experiment/eval_harness.py`; run
+  with `python .auto_experiment/eval_harness.py`.
+- **Node** → copy `references/eval_harness_template.mjs` to `.auto_experiment/eval_harness.mjs`; run
+  with `node .auto_experiment/eval_harness.mjs` (for a TypeScript entrypoint,
+  `npx tsx .auto_experiment/eval_harness.mjs`). The `.mjs` extension keeps it ESM regardless of the
+  repo's `package.json` `type`.
+
+Record the resolved `runtime` and `harness_path` in `config.json`. **Everywhere below that says
+`python .auto_experiment/eval_harness.py`, use the Node command instead when the runtime is Node** —
+the loop logic, the keep/discard gate, the `AUTO_EXP_DATA` / `AUTO_EXP_RUNS` / `AUTO_EXP_EVALUATORS`
+env vars, and the stdout contract (`{mean, stdev, runs, scored, excluded, run_means}`) are all
+identical across the two templates.
+
+**Prefer a deterministic ground-truth metric** (reference output / programmatic checker / pipeline
+count) and use an LLM-as-judge only when no ground truth exists — see the rubric's **Metric
+selection**. **No score literals anywhere.**
 
 Run it against the **original, unmodified** code with a **fixed pilot** `AUTO_EXP_RUNS` (**3** — an
 internal bootstrap value, not a user param): the harness re-runs the whole eval R times and prints
@@ -575,7 +615,8 @@ noise floor). Both computed numbers, never literals — obey the scoring policy 
 keep/discard policy** in the rubric. This pilot noise is what Step 2.4 turns into the real `runs`
 and `min_delta`.
 
-Commit `eval_harness.py`, `data.jsonl`, `data.val.jsonl`, `data.test.jsonl`, `eval_results.jsonl`.
+Commit the harness (`eval_harness.py` or `eval_harness.mjs`), `data.jsonl`, `data.val.jsonl`,
+`data.test.jsonl`, `eval_results.jsonl`.
 
 **Do NOT report the baseline to LLM-Obs yet.** Step 2.4 may raise `runs` and re-run the baseline,
 which **replaces** this pilot `mean`/`stdev`. Reporting the pilot now would publish an
@@ -662,7 +703,8 @@ reaches 0 failing datapoints, record the iteration `no_change` with the probe re
 next hypothesis — do **not** spend a full eval on a dead lever.
 
 ### Step 4 — Compute AFTER (re-run the SAME harness)
-Re-run `.auto_experiment/eval_harness.py` (same `evaluate_line`, same data) against the changed
+Re-run the committed harness (`eval_harness.py` or `eval_harness.mjs`, per `runtime`) with the same
+`evaluate_line`/`evaluateLine` and the same data, against the changed
 code. `after_score` = the new printed mean. Re-write `eval_results.jsonl`. Write the metric object
 (schema in the rubric) to `.auto_experiment/result.json` and commit it **in the same commit** as
 the change. `delta = after_score - before_score`.
@@ -705,7 +747,8 @@ Mirrors `build_followup_prompt`. Baseline is already known — **do not recomput
      a hard reset to base would delete them).
 2. `before_score` = the current best score (from `iteration_results`; iteration-1 baseline if
    nothing kept yet). Do NOT re-run the baseline.
-3. Reuse the data from `data.jsonl` and the committed `eval_harness.py` — do not reload or rebuild.
+3. Reuse the data from `data.jsonl` and the committed harness (`eval_harness.py` or
+   `eval_harness.mjs`) — do not reload or rebuild.
 4. Make **ONE new change, different from every previous attempt** (you can see prior attempts in
    `iteration_results`), aimed at a named `census.json` bucket, **in whichever in-scope file holds
    the lever** (tool/retrieval/pipeline/config/prompt — not prompt-only). Commit it.

@@ -279,7 +279,17 @@ it instead of an LLM judge** — it removes an entire layer of variance and can'
 
 ## Eval-harness spec (`_eval_harness_skill`)
 
-Write a real, committed evaluation module `.auto_experiment/eval_harness.py` with:
+**Language.** The harness must run in whatever runtime can import/run `files_to_optimize` — Python
+(`.auto_experiment/eval_harness.py`, from `references/eval_harness_template.py`) or Node/ESM
+(`.auto_experiment/eval_harness.mjs`, from `references/eval_harness_template.mjs`). SKILL.md Step 2
+auto-detects the runtime from the edit scope (with a user override). The two templates are
+functionally identical and both emit the SAME stdout JSON contract
+(`{mean, stdev, runs, scored, excluded, run_means}`) and honor the same `AUTO_EXP_DATA` /
+`AUTO_EXP_RUNS` / `AUTO_EXP_EVALUATORS` env vars, so every rule below is language-agnostic — read
+`generate_output`/`evaluate_line`/`judge` as `generateOutput`/`evaluateLine`/`judge` in the Node
+harness. The rest of this section is written with the Python names for brevity.
+
+Write a real, committed evaluation module `.auto_experiment/eval_harness.py` (or `.mjs`) with:
 
 - `generate_output(line)` — runs the **real code under test** to produce the output for ONE
   datapoint (import the real entrypoint; if the import bus-errors / fails, a copy of the needed
@@ -293,7 +303,7 @@ Write a real, committed evaluation module `.auto_experiment/eval_harness.py` wit
     model is specified, default to the Claude model selected in the Claude Code session that
     invoked this skill** — i.e. the same model running this loop. Resolve that model id (the
     session/main-loop model) and call it through the project's existing LLM configuration. Pin the resolved model id in
-    `eval_harness.py` so the judge is identical across every iteration, and state in `reasoning`
+    the harness so the judge is identical across every iteration, and state in `reasoning`
     which model you used.
   - **Make a real judge call using the project's existing LLM configuration.** Use the endpoint
     and credential the project is already set up to use — do not collect, log, or transmit
