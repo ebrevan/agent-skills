@@ -61,12 +61,12 @@ run starts** (see the Mandatory intake gate below).
 | `goal` | what "better" means; the judge rubric + optimization direction | **must ask** |
 | `evaluators` | explicit evaluator/rubric text — how each datapoint is scored (ground-truth check vs LLM-judge, pass criteria, direction). | **must ask** (do NOT silently fall back to `goal`) |
 | data source | where the eval data comes from — a **`local_dataset_path`** (a local `.jsonl`/`.csv` file on disk), **or** a `dataset_id`, **or** an `ml_app` to pull traces from (optionally narrowed by explicit `trace_ids`). | **must ask** — mandatory; the run cannot start without one of `local_dataset_path` / `dataset_id` / `ml_app` (priority below) |
+| `datadog_backend` | `mcp` or `pup` — which client reaches Datadog for **every** call the run makes (dataset reads, span/trace reads, and the experiment create/update/event-submit writes). See **Datadog backend** below. | **must ask** — no default; the two backends are not interchangeable (provenance + dataset-loading differ), so the user picks |
 | `max_iterations` | how many changes to try (clamp **1–50**) | _default_ **2** |
 | `max_runs` | ceiling on the derived `runs` — how many times the harness may repeat the eval per candidate to beat variance (clamp **3–20**; the pilot already runs 3×, so 3 is the floor) | _default_ **3** |
 | `model` | judge model id | _default_: the Claude model selected in this session (see rubric) |
 | `base_branch` | branch the baseline is measured on | _default_: current branch / `main` |
 | `domain_notes` | **a list of strings** — product/domain facts the agents cannot infer from the code (what a term of art means, which behaviours are intended, what a reference row represents), one note per entry. Carried verbatim into every sub-agent briefing, every census describer, and the judge prompt. | _default_ **`[]`** |
-| `datadog_backend` | `mcp` or `pup` — which client reaches Datadog for **every** call the run makes (dataset reads, span/trace reads, and the experiment create/update/event-submit writes). See **Datadog backend** below. | _default_ **`mcp`** |
 
 `runs` and `min_delta` are **not inputs** — they are **derived** from the measured baseline noise in
 Step 2.4, not chosen by anyone. Do **not** ask for them and do **not** show them in the all-params
@@ -108,6 +108,13 @@ Before writing any config or touching git:
      `.jsonl`/`.csv` file), **or** a `dataset_id`, **or** an `ml_app` to find traces from
      (optionally narrowed by explicit `trace_ids`). Do not auto-pick, do not guess an `ml_app`, do
      not invent a file path, and do not start the run with none — if all are missing, ask.
+   - **`datadog_backend`** — `mcp` or `pup`. **There is no default**: if the user did not name a
+     backend, **ask** (use `AskUserQuestion`, options `mcp` / `pup`) and wait. Never pick one
+     yourself, not even when only one looks available — the choice determines the run's recorded
+     provenance and how the corpus is loaded (on `mcp`, a dataset over ~19 records cannot be read by
+     any MCP tool and needs a direct REST call; `pup` has a first-class `records-all`). Two runs on
+     different backends are not strictly comparable, so guessing silently makes a comparison the user
+     never sanctioned. See **Datadog backend** for the trade-offs to state when asking.
 
    **A detailed, specific goal is NOT permission to infer any must-ask field.** A rich goal is the
    single most common cause of wrongly auto-filling `files_to_optimize`, `evaluators`, and the data
@@ -120,7 +127,8 @@ Before writing any config or touching git:
    `config.json`, do not create the scratch branch, do not run the harness — ask (use
    `AskUserQuestion`) and wait.
 2. Fill the **default** fields (`max_iterations`, `max_runs`, `model`, `base_branch`,
-   `domain_notes`, `datadog_backend`) with their defaults above. Do **not** touch
+   `domain_notes`) with their defaults above. `datadog_backend` is **not** among them — it is
+   must-ask, per step 1. Do **not** touch
    `runs`/`min_delta` here — they are derived in Step 2.4, not intake params (`max_runs` only caps
    that derivation).
 
@@ -154,7 +162,7 @@ the run's state + audit trail):
   "local_dataset_path": "...", "dataset_id": "...", "trace_ids": [...],
   "dd_auto_experiment_id": null,
   "domain_notes": [],
-  "datadog_backend": "mcp",
+  "datadog_backend": null,
   "backend_used": null,
   "backend_version": null,
   "backend_fallback": false,
@@ -168,7 +176,9 @@ the run's state + audit trail):
 ```
 
 `runs` and `min_delta` start `null` — they are **computed and written in Step 2.4** from the
-measured baseline noise, never chosen at intake.
+measured baseline noise, never chosen at intake. `datadog_backend` is shown `null` above only
+because it has no default: by the time `config.json` is written it must hold the user's explicit
+`"mcp"` or `"pup"`. A `null` there at Setup means the intake gate was skipped — STOP and ask.
 
 **Per-iteration timing.** Every `iteration_results` row (including iteration 0, the baseline)
 records `time_start` and `time_end` as **ISO-8601 UTC** wall-clock strings (e.g.
@@ -280,6 +290,12 @@ per-call: a run is unambiguously "via MCP" or "via pup", so its provenance is ne
 backend actually used in `config.json` as `backend_used`, because two runs that reached different
 backends are not strictly comparable.
 
+**It is a mandatory intake field with no default** — ask the user for `mcp` or `pup` and wait for
+their answer (intake gate, step 1). The table below is what to tell them: the backends differ in what
+they can even do (only `pup` can load a whole dataset in one command) and in failure policy (a
+missing `pup` is a STOP, a failing MCP call falls back), so the choice is the user's, not an
+implementation detail to be defaulted away.
+
 | purpose | `mcp` tool | `pup llm-obs …` subcommand | |
 |---|---|---|---|
 | **read the whole dataset** | ✗ no MCP tool can — see below | `datasets records-all --dataset-id D` | ★ |
@@ -367,8 +383,9 @@ array>'` in 1.8.0. Check `pup --version` and `pup agent schema` for the installe
 trusting this table's flags verbatim, and record the version in `config.json` alongside
 `backend_used`.
 
-**Read this table as a substitution rule for the whole file.** The steps below name MCP tools
-because that is the default backend; wherever one appears, it means *"this purpose, via the selected
+**Read this table as a substitution rule for the whole file.** The steps below name MCP tools purely
+as the naming convention — that is not a default, and naming one is never a licence to use MCP when
+the user chose `pup`. Wherever an MCP tool appears, it means *"this purpose, via the selected
 backend"*. Under `datadog_backend: pup`, `submit_llmobs_experiment_events` means
 `pup llm-obs experiments events submit --metrics '[{…}]' <EXPERIMENT_ID>`, and so on down the table. Nothing else about a step
 changes — same order, same gates, same payloads.
@@ -493,7 +510,7 @@ ran because you intended it to.
 |---|---|---|
 | 1 | clean tree + start SHA | `git rev-parse HEAD` recorded in `config.json` `start_sha`; tree clean or unrelated changes stashed |
 | 2 | scratch branch | `git branch --show-current` equals the scratch branch off `base_branch` |
-| 3 | `config.json` written | file exists with every required field populated (incl. the resolved `files_to_optimize` list, `evaluators` verbatim, data source) |
+| 3 | `config.json` written | file exists with every required field populated (incl. the resolved `files_to_optimize` list, `evaluators` verbatim, data source, and `datadog_backend` = the user's explicit `"mcp"`/`"pup"` — `null` or an unasked value means the intake gate was skipped) |
 | 4 | experiment id | `$experiment-id` validated as a UUID at the intake gate and persisted to `config.json` as `dd_auto_experiment_id` |
 | 5 | run context on experiment | confirm the `update_llmobs_experiment` call (or `pup llm-obs experiments update`) **actually returned a success response in hand** (not merely that you intended to call it). For the us5 MCP that response is `updated_fields` containing `"metadata"` — accept that, or any non-error response acknowledging the metadata write if the tool's shape differs. The check is "the call was made and acknowledged", so do not hard-block on one exact field name; if it errored or was never called, re-run it. |
 | 6 | backend reachable | with `datadog_backend: pup`, `pup auth status` (or `$PUP_BIN auth status`) returned `authenticated: true` for the expected site — run the check, don't assume the binary works. A missing or unauthenticated pup is a **STOP**, not a fallback (see **Datadog backend**). With `datadog_backend: mcp`, step 5's acknowledged response is itself the proof the backend is reachable. Record `backend_used` in `config.json` either way. **Under pup, satisfy step 5 by reading the experiment back** (`pup llm-obs experiments list --filter-project-id …` and confirm the metadata/status you just wrote). On released pup `experiments update` exits non-zero on a response-parsing bug even when the write landed, so an exit-code check would fail a step that actually succeeded; DataDog/pup#682 fixes that but is not merged yet. Read-back is correct either way, so use it unconditionally rather than branching on the build. |
