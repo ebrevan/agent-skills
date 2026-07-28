@@ -577,9 +577,16 @@ both emit the identical JSON and honor the same env vars.
   **Node**; (2) if any is `.py`, or the manifest is `pyproject.toml`/`requirements.txt`/`setup.py` →
   **Python**; (3) if the scope is language-neutral (e.g. a `.md` prompt file), fall back to the
   language of the app whose entrypoint `generate_output`/`generateOutput` must call.
-- **Honor an explicit `runtime` override** if the user set one at intake. If detection is ambiguous
-  (both manifests present, or a `.md`-only scope with no obvious app language), **ask the user** for
-  `runtime` (`python` | `node`) rather than guess.
+- **Default to Python when the runtime is neither Node nor Python.** If the code under test is in
+  some other language (Go, Ruby, Rust, …), or the language can't be determined, use the **Python**
+  harness: it can drive any code-under-test out-of-process via `subprocess` (the language-agnostic
+  path — the harness spawns the real code and reads its stdout), so it is the safe general-purpose
+  default. The native Node harness is just the in-process convenience for Node/TS apps; everything
+  else goes through Python.
+- **Honor an explicit `runtime` override** if the user set one at intake. If detection is genuinely
+  ambiguous (e.g. both a `package.json` and a `pyproject.toml`/`requirements.txt` enclose the scope),
+  you may **ask the user** for `runtime` (`python` | `node`) rather than guess — but absent an
+  answer, default to **Python** per the rule above.
 
 Then copy the matching template and fill in the two functions (`generate_output`/`generateOutput`
 runs the REAL code under test from `files_to_optimize`; `judge` scores it):
