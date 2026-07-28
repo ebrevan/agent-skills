@@ -28,6 +28,11 @@ backend + pup flags, the runner contract, export mode, polling, the trace-link s
 `references/local-setup.md` (making a deployed-only app locally runnable). Read `details.md` before you touch
 pup or generate the runner.**
 
+**Writing code — keep comments minimal to none.** Everything you generate or edit (the annotation, the
+runner's `ENTRYPOINTS` entries, a local harness, iteration edits) should match the surrounding code and
+carry **no unnecessary comments** — don't narrate what the code plainly does; add a comment only for a
+genuinely non-obvious *why*.
+
 ## Interaction model — selector gates, never a hard stop
 
 This is a live loop. At every decision point present the choices as an **`AskUserQuestion` selector** (the
