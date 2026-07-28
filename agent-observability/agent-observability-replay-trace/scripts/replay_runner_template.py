@@ -30,10 +30,13 @@ from ddtrace.llmobs import LLMObs
 from {{MODULE}} import {{ENTRYPOINT_FN}}   # , {{ANOTHER_ENTRYPOINT_FN}}, ...
 
 ML_APP = os.environ.get("DD_LLMOBS_ML_APP", "{{ML_APP}}")
-# Local replays emit under "<ml_app>-local" (idempotent) so they never pollute the production ml_app's
-# traces — the original trace stays under the real ml_app; every replay lands under "-local".
+# Local replays emit under "<ml_app>-local" (idempotent) so they never pollute the production ml_app.
 if not ML_APP.endswith("-local"):
     ML_APP = ML_APP + "-local"
+# Interlock: refuse to emit under a non-isolated ml_app. NOTE this only guards the init-level setting — if
+# the app sets ml_app per span/call it overrides this (see the pre-flight in references/details.md).
+if not ML_APP.endswith("-local"):
+    raise SystemExit(f"[replay] refusing to run: ml_app {ML_APP!r} is not isolated (must end in -local)")
 
 # Export mode: agentless is the right default for a LOCAL replay (ships LLM Obs spans straight to Datadog,
 # no Agent needed). If this app is instead wired to a local Agent sidecar, set DD_LLMOBS_AGENTLESS_ENABLED=0.

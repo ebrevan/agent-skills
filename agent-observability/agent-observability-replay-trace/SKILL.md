@@ -50,7 +50,10 @@ until they pick "stop here".
 - **A trace-access backend** — the `datadog-llmo` MCP (preferred) or `pup` (step 0).
 - **Credentials:** `DD_API_KEY` + `DD_SITE` + provider key(s). **Not `DD_APP_KEY`** — plain trace, not an
   Experiment (that's `agent-observability-replay-experiment`).
-- **Side effects:** replaying re-runs real code (model spend + any real writes). Warn before the first replay.
+- **Side effects, irreversible:** replaying re-runs real code (model spend + real writes), and **LLM Obs
+  traces cannot be deleted** — a mis-scoped replay (wrong ml_app) *permanently* pollutes the production app's
+  dashboards/eval sets. That's why the `<ml_app>-local` isolation (steps 4/6/7) is load-bearing, not tidy.
+  Warn before the first replay.
 
 ## Workflow
 
@@ -60,8 +63,10 @@ Pick, in order: (1) MCP if `mcp__datadog-llmo-mcp__*` tools are present; (2) els
 `claude mcp add --scope user --transport http "datadog-llmo-mcp" '…?toolsets=llmobs'` (pup stays a
 use-if-present fallback, not something to install). Don't proceed without a backend.
 The backend↔operation mapping and **pup's exact flags/gotchas are in `details.md` — read that section before
-using pup.** The one pup thing you must not miss: parse results under **`data.spans[]`** with `--no-agent` —
-reading the top level returns **zero hits on an ingested trace**, a silent false negative (step 7).
+using pup.** Two pup musts: (1) results come back at **`data.spans[]`** *or* top-level **`spans[]`**
+(varies by version/`--no-agent`) — parse **whichever is present**, or you get zero hits on an ingested
+trace (a silent false negative, step 7); (2) check **token expiry** (`pup auth status`), not just that auth
+exists — expiry mid-loop looks like "trace not found."
 
 ### 1. Parse the command
 `<trace-id>` + optional free-text modification (everything after the id); none → diff-only mode. Determine
@@ -78,8 +83,10 @@ actually move, or the delta drowns in noise.
 ### 2.5. Check for fan-out
 If the root span **fans out into repeated sibling subtrees** (a batch/map over N parallel sub-runs), the
 change under test is usually visible in a **single** branch — replaying the whole root costs ~N× spend and
-time for no extra signal. Offer to replay one representative branch; **log what you skipped**. Full root only
-if the change is inherently cross-branch.
+time for no extra signal. Offer to replay one representative branch; **log what you skipped**. **Pick deliberately: the cheapest
+branch that reached the terminal / side-effecting tool** (most branches are no-ops that prove nothing), and
+reconstruct its input from the **child** span's input, not the root's. Full root only if the change is
+inherently cross-branch.
 
 ### 3. Resolve the entrypoint + input
 - **Entrypoint:** `metadata.replay_entrypoint` if present; else infer from the root span (name/kind) + code
@@ -96,30 +103,43 @@ callable (ports-and-adapters) — just extract/call that seam; full local-setup 
 
 ### 4. Ensure the two persistent artifacts (one-time setup)
 - **a) In-entrypoint annotation** on the app's **real** entrypoint, so all future traces (production too)
-  self-describe:
+  self-describe. Stamp it at **span start, not the success/deferred-finish path** — a failed run must still
+  carry `replay_input` (those are the ones you most want to replay):
   ```python
   LLMObs.annotate(span=span, metadata={"replay_entrypoint": "<stable id>", "replay_input": <extractor>})
   ```
-  No `replay_output` — the original trace is the baseline.
+  No `replay_output` — the original trace is the baseline. (Non-Python annotate APIs differ — e.g. Go
+  `span.Annotate(llmobs.WithAnnotatedMetadata(...))`; see `details.md`.)
+- **Isolation pre-flight (before writing the runner):** grep the entrypoint's call path for **per-span/
+  per-call ml_app overrides** (Go `llmobs.WithMLApp`; Python `ml_app=` on a decorator or in
+  `LLMObs.annotate`). Those **beat** the init-level `-local`, so the app's spans can still land in
+  production — tracer-level config is **not** proof of isolation. If any exist, the app's ml_app must
+  resolve from env so `-local` wins.
 - **b) The runner** — satisfies the **language-independent runner contract in `details.md`** (load env →
   derive `<ml_app>-local` → dispatch one entrypoint on JSON → **flush on every exit path incl. errors** →
-  print the `-local` ml_app). **Python:** copy `scripts/replay_runner_template.py` and fill `ENTRYPOINTS`.
-  **Other languages:** write to the contract — don't assume the Python API carries over (see the Go notes +
-  export-mode gotchas in `details.md`). Infer + **confirm the run command**, and follow the host repo's
-  **build-file conventions** for the new file (Bazel/Gazelle, lockfiles, …).
+  **refuse to start unless ml_app ends in `-local`** → print the `-local` ml_app). **Python:** copy
+  `scripts/replay_runner_template.py` and fill `ENTRYPOINTS`. **Other languages:** write to the contract —
+  don't assume the Python API carries over (Go APIs + export-mode gotchas in `details.md`), and where the
+  language has no in-process dotenv add a **run wrapper (artifact c)** that sources the project env, unsets
+  ambient provider vars, and exports the `-local` override. Infer + **confirm the run command**; follow the
+  host repo's **build-file conventions** (Bazel/Gazelle → `cmd/<name>/`, run Gazelle, build before replay).
 
 ### 5. (If a change was requested) edit, then gate
 Make the code changes, show the developer the diff of your changes, then an `AskUserQuestion` selector:
 **Replay now** / **Adjust the changes first** / **Cancel**. Only replay on "Replay now".
 
 ### 6. Replay
-Before the first replay: **warn** (re-running is real — model spend + real writes), and **check the ambient
-environment** and surface it — a provider key (`OPENAI_API_KEY`, …) or ambient `DD_*` in the shell can
-reroute the model gateway or telemetry so the replay doesn't match production, a fidelity gap **invisible in
-the diff**. Report what you found; let the user decide.
-On confirmation, record `t0` and run (marker in the env):
+Before the first replay: **warn** (re-running is real — model spend + real writes), and **sanitize the
+environment**. The **coding agent's own env** (`ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` set by Claude
+Code, and other provider keys) can make the app's SDK **bypass its configured model gateway** — a fidelity
+gap **invisible in the diff**. **Unset ambient provider vars by default and report that you did** (don't
+just ask); grep the app for its own ambient-key guards. Also **verify the credential's org matches the
+trace's org** — a mismatch ships the replay somewhere you can't query (looks like ingest lag).
+On confirmation, record `t0` and run — **source the project's env file, never inline secrets** (the marker
+tag is fine on the command; `DD_API_KEY=<value>` inline is blocked by the permission classifier and leaks to
+history/transcript — use the wrapper/env-file):
 ```
-DD_TAGS=replay_run_id:<unique-id> <run cmd> --entrypoint <id> --input-file <path>
+DD_TAGS=replay_run_id:<unique-id> <run cmd or wrapper> --entrypoint <id> --input-file <path>
 ```
 The runner emits **under `<ml_app>-local`** (idempotent, so replays never pollute production) and prints that
 name — poll for the new trace **under it**.
@@ -129,23 +149,37 @@ name — poll for the new trace **under it**.
 - **Ingest poll:** after it returns, poll the backend **every ~5s up to ~2 min** for the `replay_run_id` tag
   under `<ml_app>-local` (pup: `--query "replay_run_id:<id>"`, plain `key:value`). **Before ever reporting
   "not found," re-query with no tag filter** (just `<ml_app>-local` + window): if that returns spans, your
-  filter/parse/scope is wrong — **not** ingestion. A false "no trace" is the worst outcome (reads as normal,
-  invites a wasteful re-run). Don't hard-fail; offer to keep waiting.
+  filter/parse/scope is wrong — **not** ingestion. A false "no trace" reads as normal and invites a wasteful
+  re-run.
+- **Verify isolation on each hit — a tag match is NOT proof.** `--query`/tag matching can return a span
+  whose real `ml_app` is a *different* app (the `--ml-app` filter gets ignored). Read `ml_app` off every
+  returned span and **assert it ends in `-local`** before reporting a clean replay — otherwise you report
+  "clean replay under `-local`" while the trace is actually in production (which you can't undo). This false
+  *confidence* is worse than the false negative. Don't hard-fail on timeout; offer to keep waiting.
 
 ### 8. Diff (with links to both traces)
 Concise summary of how the **new output differs from the old** — meaningful differences only. Note live-world
-drift; and if the edit targeted **model-facing text** (prompt/system/tool-schema), sampling variance makes
-n=1 *suggestive, not conclusive* — offer 2–3 replays. Lead the diff with both trace links:
-- **Old:** `trace_url` **verbatim**.
+drift; and because any nondeterministic agent varies run-to-run, **default to two replays** (diff-only mode
+too, not just model-facing edits) and use **replay-to-replay comparison** — if the two local runs differ
+from each other about as much as from production, the delta is sampling variance, not your change. If the
+replay **disables a side-effecting integration** (dry-run), that integration's subtree is absent — **exclude
+it from both sides** before comparing span counts, or the structural diff is junk. Lead the diff with both
+trace links:
+- **Old:** `trace_url` **verbatim** — but **under fan-out** (you replayed one branch) link the **branch
+  span**, not the whole-root url.
 - **New (replay):** must carry `ml_app=<ml_app>-local` or it opens **empty** — and the `trace_url` is an
   org-switch wrapper (`…/switch_to_user/<id>?next=<encoded /llm/traces …>&flow=org_switch`), so **inject
   `ml_app=<ml_app>-local` into the decoded `next` query and re-encode; do NOT append to the outer URL**
   (mechanics in `details.md`). Browser-unverifiable from here — confirm once it opens non-empty.
 
-### 9. Iterate — gate on a selector
-After the diff, an `AskUserQuestion` selector: **Looks good — stop here** (finish; leave the edits in the
-working tree) / **Make more changes** (free-text inline → back to step 5). Re-present after every replay;
-end only on "stop here".
+### 9. Gate — iterate, or stop on a broken harness
+**Harness-failure gate (before the diff):** if a replay reveals the harness is wrong — trace landed under
+the wrong ml_app, no trace after the step-7 sanity checks, missing flush, or auth/org misrouted — **do NOT
+proceed to a diff on bad data.** Stop and present a selector to fix the harness (re-scope ml_app / add flush
+/ fix env) and re-replay.
+Otherwise, after the diff, an `AskUserQuestion` selector: **Looks good — stop here** (finish; leave the edits
+in the working tree) / **Make more changes** (free-text inline → back to step 5). Re-present after every
+replay; end only on "stop here".
 
 ## Reference
 - `references/details.md` — trace backend + **pup exact flags**, the **runner contract** (+ Go, export mode),
