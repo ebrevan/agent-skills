@@ -34,7 +34,14 @@ ML_APP = os.environ.get("DD_LLMOBS_ML_APP", "{{ML_APP}}")
 # traces — the original trace stays under the real ml_app; every replay lands under "-local".
 if not ML_APP.endswith("-local"):
     ML_APP = ML_APP + "-local"
-LLMObs.enable(ml_app=ML_APP, agentless_enabled=True)
+
+# Export mode: agentless is the right default for a LOCAL replay (ships LLM Obs spans straight to Datadog,
+# no Agent needed). If this app is instead wired to a local Agent sidecar, set DD_LLMOBS_AGENTLESS_ENABLED=0.
+# Benign gotcha: with agentless on, the APM tracer may still dial localhost:8126 and log
+# "ERROR: lost N traces ... connection refused". That is HARMLESS — the LLM Obs spans ship independently and
+# arrive fine — so don't mistake it for a failed replay.
+_agentless = os.environ.get("DD_LLMOBS_AGENTLESS_ENABLED", "1").lower() not in ("0", "false", "no")
+LLMObs.enable(ml_app=ML_APP, agentless_enabled=_agentless)
 
 
 # Dispatch table — ONE entry per execution type, keyed by the replay_entrypoint id the app annotates.
@@ -64,11 +71,20 @@ def main():
 
     # Run the entrypoint DIRECTLY — no wrapper span — so the replay trace is structurally identical to a
     # normal run. The correlation marker rides along as a span tag via DD_TAGS (set by the caller).
-    _run_entrypoint(ENTRYPOINTS[args.entrypoint], input_data)
+    # Flush in `finally` so a FAILED replay still emits its partial trace — otherwise the error path leaves
+    # nothing to diff, which is worse than a visible failure.
+    status, error = "done", None
+    try:
+        _run_entrypoint(ENTRYPOINTS[args.entrypoint], input_data)
+    except Exception as exc:  # noqa: BLE001 — surface any failure, but flush first
+        status, error = "error", repr(exc)
+    finally:
+        LLMObs.flush()  # make sure the trace (even a partial one) is sent before we exit
 
-    LLMObs.flush()  # agentless: make sure the trace is sent before we exit
     # ml_app is the "-local" name the caller should poll under for the new trace.
-    print(json.dumps({"status": "done", "entrypoint": args.entrypoint, "ml_app": ML_APP}))
+    print(json.dumps({"status": status, "entrypoint": args.entrypoint, "ml_app": ML_APP, "error": error}))
+    if status == "error":
+        sys.exit(1)
 
 
 if __name__ == "__main__":
