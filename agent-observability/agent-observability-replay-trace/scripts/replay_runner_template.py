@@ -30,7 +30,21 @@ from ddtrace.llmobs import LLMObs
 from {{MODULE}} import {{ENTRYPOINT_FN}}   # , {{ANOTHER_ENTRYPOINT_FN}}, ...
 
 ML_APP = os.environ.get("DD_LLMOBS_ML_APP", "{{ML_APP}}")
-LLMObs.enable(ml_app=ML_APP, agentless_enabled=True)
+# Local replays emit under "<ml_app>-local" (idempotent) so they never pollute the production ml_app.
+if not ML_APP.endswith("-local"):
+    ML_APP = ML_APP + "-local"
+# Interlock: refuse to emit under a non-isolated ml_app. NOTE this only guards the init-level setting — if
+# the app sets ml_app per span/call it overrides this (see the pre-flight in references/details.md).
+if not ML_APP.endswith("-local"):
+    raise SystemExit(f"[replay] refusing to run: ml_app {ML_APP!r} is not isolated (must end in -local)")
+
+# Export mode: agentless is the right default for a LOCAL replay (ships LLM Obs spans straight to Datadog,
+# no Agent needed). If this app is instead wired to a local Agent sidecar, set DD_LLMOBS_AGENTLESS_ENABLED=0.
+# Benign gotcha: with agentless on, the APM tracer may still dial localhost:8126 and log
+# "ERROR: lost N traces ... connection refused". That is HARMLESS — the LLM Obs spans ship independently and
+# arrive fine — so don't mistake it for a failed replay.
+_agentless = os.environ.get("DD_LLMOBS_AGENTLESS_ENABLED", "1").lower() not in ("0", "false", "no")
+LLMObs.enable(ml_app=ML_APP, agentless_enabled=_agentless)
 
 
 # Dispatch table — ONE entry per execution type, keyed by the replay_entrypoint id the app annotates.
@@ -60,10 +74,20 @@ def main():
 
     # Run the entrypoint DIRECTLY — no wrapper span — so the replay trace is structurally identical to a
     # normal run. The correlation marker rides along as a span tag via DD_TAGS (set by the caller).
-    _run_entrypoint(ENTRYPOINTS[args.entrypoint], input_data)
-
-    LLMObs.flush()  # agentless: make sure the trace is sent before we exit
-    print(json.dumps({"status": "done", "entrypoint": args.entrypoint}))
+    # Flush in `finally` so a FAILED replay still emits its partial trace — otherwise the error path leaves
+    # nothing to diff, which is worse than a visible failure.
+    status, error = "done", None
+    try:
+        _run_entrypoint(ENTRYPOINTS[args.entrypoint], input_data)
+    except Exception as exc:  # noqa: BLE001 — normal failures → report + exit 1
+        status, error = "error", repr(exc)
+    finally:
+        LLMObs.flush()  # send the trace (even a partial one) before we exit
+        # Print in `finally` so the caller always gets ml_app to poll — even if the entrypoint raised
+        # SystemExit/KeyboardInterrupt (which skip `except Exception` but still run `finally`, then propagate).
+        print(json.dumps({"status": status, "entrypoint": args.entrypoint, "ml_app": ML_APP, "error": error}))
+    if status == "error":
+        sys.exit(1)
 
 
 if __name__ == "__main__":
