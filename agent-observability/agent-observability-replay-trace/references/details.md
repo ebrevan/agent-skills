@@ -15,8 +15,10 @@ The skill reads traces through one of two backends; every other step is backend-
 
 Prefer the **MCP** (richest — structured tree, `content_info`, a ready `trace_url`). Fall back to **pup**
 when the MCP isn't installed (`pup auth` must point at the app's org). If neither is available, guide the
-user to install the MCP (one `claude mcp add …?toolsets=llmobs` command — easier than pup's brew-install +
-`pup auth login`). Both the MCP and pup return a ready **`trace_url`** — use it verbatim (no construction).
+user to install the MCP — one command,
+`claude mcp add --scope user --transport http "datadog-llmo-mcp" "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp?toolsets=llmobs"`
+(confirm the current URL at https://docs.datadoghq.com/bits_ai/mcp_server/setup/), easier than pup's
+brew-install + `pup auth login`. Both the MCP and pup return a ready **`trace_url`** — use it verbatim (no construction).
 
 **pup exact usage** (flags are non-obvious, and this copy has drifted from reality before — treat
 `pup <cmd> --help` and pup's own error text as the source of truth; keep only the non-obvious bits here):

@@ -33,7 +33,9 @@ edit (see §2) — still lighter than treating the whole app as non-runnable.
 dry-run / no-op / sandbox mode or a nil-adapter branch built for exactly this situation. Using the app's own
 affordance is **safer and higher fidelity** than a mock — it exercises the real code path right up to the
 side effect, and it's code the owners already trust. Check for it (flags, env vars, a `--dry-run`, a
-nil/fake adapter) and prefer it; only fall back to stubs (§4) where no such affordance exists.
+nil/fake adapter) and prefer it. Only fall back to a **stub** — a fake/no-op stand-in for a dependency
+that either isn't reachable locally or whose real call would re-trigger a side-effecting write — where no
+such affordance exists; the per-dependency **stub-vs-real** decision is §4's second handback.
 
 Read the code around the entrypoint and produce a concrete, reviewable plan covering:
 - **The local entry point** you'll scaffold — a thin module that invokes the core agent logic with a JSON

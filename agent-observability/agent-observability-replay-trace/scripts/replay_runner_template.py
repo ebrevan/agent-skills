@@ -79,13 +79,13 @@ def main():
     status, error = "done", None
     try:
         _run_entrypoint(ENTRYPOINTS[args.entrypoint], input_data)
-    except Exception as exc:  # noqa: BLE001 — surface any failure, but flush first
+    except Exception as exc:  # noqa: BLE001 — normal failures → report + exit 1
         status, error = "error", repr(exc)
     finally:
-        LLMObs.flush()  # make sure the trace (even a partial one) is sent before we exit
-
-    # ml_app is the "-local" name the caller should poll under for the new trace.
-    print(json.dumps({"status": status, "entrypoint": args.entrypoint, "ml_app": ML_APP, "error": error}))
+        LLMObs.flush()  # send the trace (even a partial one) before we exit
+        # Print in `finally` so the caller always gets ml_app to poll — even if the entrypoint raised
+        # SystemExit/KeyboardInterrupt (which skip `except Exception` but still run `finally`, then propagate).
+        print(json.dumps({"status": status, "entrypoint": args.entrypoint, "ml_app": ML_APP, "error": error}))
     if status == "error":
         sys.exit(1)
 

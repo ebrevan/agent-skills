@@ -59,9 +59,14 @@ until they pick "stop here".
 
 ### 0. Ensure a trace-access backend
 Pick, in order: (1) MCP if `mcp__datadog-llmo-mcp__*` tools are present; (2) else `pup` if installed and
-`pup auth` targets the app's org; (3) else guide the **one-command MCP install** —
-`claude mcp add --scope user --transport http "datadog-llmo-mcp" '…?toolsets=llmobs'` (pup stays a
-use-if-present fallback, not something to install). Don't proceed without a backend.
+`pup auth` targets the app's org; (3) else guide the **one-command MCP install** (pup stays a
+use-if-present fallback, not something to install):
+```
+claude mcp add --scope user --transport http "datadog-llmo-mcp" \
+  "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp?toolsets=llmobs"
+```
+(Confirm the current server URL at https://docs.datadoghq.com/bits_ai/mcp_server/setup/.) Don't proceed
+without a backend.
 The backend↔operation mapping and **pup's exact flags/gotchas are in `details.md` — read that section before
 using pup.** Two pup musts: (1) results come back at **`data.spans[]`** *or* top-level **`spans[]`**
 (varies by version/`--no-agent`) — parse **whichever is present**, or you get zero hits on an ingested
