@@ -7,7 +7,7 @@ description: >-
   /agent-observability-replay-trace <trace-id> [changes to test]. Signals: "replay this trace"; "iterate on
   a trace"; "this trace's output is wrong, fix it and re-run"; "re-run trace <id> with <change>"; pasting a
   trace id from the Agent Observability UI with a description of what to fix. It fetches the trace via the
-  datadog-llmo MCP (or the pup CLI as a fallback), edits code, re-runs the app to emit a NEW trace, and
+  datadog-llmo MCP or the pup CLI, edits code, re-runs the app to emit a NEW trace, and
   diffs the two — no local server, no browser. For agents traced with ddtrace / LLM Obs (Python first-class), with JSON-serializable entry
   input. Do NOT use for: scored Experiments or the browser "Replay" button (that's
   agent-observability-replay-experiment), building an experiment from a dataset/CSV, writing evaluators,
@@ -47,7 +47,8 @@ until they pick "stop here".
   other languages work but you write the runner to the contract in their SDK/build tooling.
 - **JSON-serializable entrypoint input**, and a **callable seam** for the root span (see step 3.5 — not a
   binary "is it runnable?"; deployed-only apps often still expose a plain callable).
-- **A trace-access backend** — the `datadog-llmo` MCP (preferred) or `pup` (step 0).
+- **A trace-access backend** — the `datadog-llmo` MCP (used when present) or the `pup` CLI (fallback, and
+  the easier install if you have neither) (step 0).
 - **Credentials:** `DD_API_KEY` + `DD_SITE` + provider key(s). **Not `DD_APP_KEY`** — plain trace, not an
   Experiment (that's `agent-observability-replay-experiment`).
 - **Side effects, irreversible:** replaying re-runs real code (model spend + real writes), and **LLM Obs
@@ -58,15 +59,15 @@ until they pick "stop here".
 ## Workflow
 
 ### 0. Ensure a trace-access backend
-Pick, in order: (1) MCP if `mcp__datadog-llmo-mcp__*` tools are present; (2) else `pup` if installed and
-`pup auth` targets the app's org; (3) else guide the **one-command MCP install** (pup stays a
-use-if-present fallback, not something to install):
+Pick, in order: (1) the **MCP** if `mcp__datadog-llmo-mcp__*` tools are present — the default (slightly
+richer for reads: structured tree + `content_info`); (2) else **`pup`** if installed and `pup auth` targets
+the app's org; (3) else the user has neither → guide the **pup install** (it's easier to set up than the
+MCP, so recommend pup here):
 ```
-claude mcp add --scope user --transport http "datadog-llmo-mcp" \
-  "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp?toolsets=llmobs"
+brew tap datadog-labs/pack && brew install datadog-labs/pack/pup
+pup auth login
 ```
-(Confirm the current server URL at https://docs.datadoghq.com/bits_ai/mcp_server/setup/.) Don't proceed
-without a backend.
+(MCP alternative: `claude mcp add --scope user --transport http "datadog-llmo-mcp" "https://mcp.datadoghq.com/api/unstable/mcp-server/mcp?toolsets=llmobs"`; see https://docs.datadoghq.com/bits_ai/mcp_server/setup/.) Don't proceed without a backend.
 The backend↔operation mapping and **pup's exact flags/gotchas are in `details.md` — read that section before
 using pup.** Two pup musts: (1) results come back at **`data.spans[]`** *or* top-level **`spans[]`**
 (varies by version/`--no-agent`) — parse **whichever is present**, or you get zero hits on an ingested
