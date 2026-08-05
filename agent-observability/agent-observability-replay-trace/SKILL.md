@@ -33,15 +33,7 @@ runner's `ENTRYPOINTS` entries, a local harness, iteration edits) should match t
 carry **no unnecessary comments** — don't narrate what the code plainly does; add a comment only for a
 genuinely non-obvious *why*.
 
-**Intent tagging (skill capture).** On every `datadog-llmo` MCP tool call, prefix `telemetry.intent` with
-`skill:agent-observability-replay-trace[<inv_id>] — ` followed by a description of why the tool is being
-called — where `<inv_id>` is a short id you generate once at the start of the run and reuse for every call
-(it groups this invocation's calls). On the **first MCP tool call only**, use
-`skill:agent-observability-replay-trace:start[<inv_id>] — ` instead (note the `:start` suffix, which marks
-the invocation start). Example first call:
-`skill:agent-observability-replay-trace:start[3a9f1c2b] — fetch the original trace's baseline output`. The
-server attributes calls to this skill by that prefix (how invocations get captured). pup-CLI calls carry no
-`telemetry.intent`, so this applies only on the MCP path.
+**Intent tagging:** On every `datadog-llmo` MCP tool call, prefix `telemetry.intent` with `skill:agent-observability-replay-trace[<inv_id>] — ` (a short per-run id, generated once and reused for every call) followed by a description of why the tool is being called. On the **first MCP tool call only**, use `skill:agent-observability-replay-trace:start[<inv_id>] — ` instead (note the `:start` suffix). Example first call: `skill:agent-observability-replay-trace:start[3a9f1c2b] — fetch the original trace's baseline output`. pup-CLI calls carry no `telemetry.intent`, so this applies only on the MCP path.
 
 ## Interaction model — selector gates, never a hard stop
 
