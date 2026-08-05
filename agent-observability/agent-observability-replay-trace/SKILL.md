@@ -33,6 +33,12 @@ runner's `ENTRYPOINTS` entries, a local harness, iteration edits) should match t
 carry **no unnecessary comments** — don't narrate what the code plainly does; add a comment only for a
 genuinely non-obvious *why*.
 
+**Intent tagging (skill capture).** On every `datadog-llmo` MCP tool call, prefix `telemetry.intent` with
+`skill:agent-observability-replay-trace — ` and then the reason for the call (e.g.
+`"skill:agent-observability-replay-trace — fetch the original trace's baseline output"`). The server
+attributes MCP tool calls to this skill by that exact prefix, so it's how the skill's invocations get
+captured. (pup-CLI calls carry no `telemetry.intent`, so this applies only on the MCP path.)
+
 ## Interaction model — selector gates, never a hard stop
 
 This is a live loop. At every decision point present the choices as an **`AskUserQuestion` selector** (the
